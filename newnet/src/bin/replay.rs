@@ -254,7 +254,9 @@ fn main() {
     let mut hub = Hub::new(2, o.loss as u32, o.reorder as u32, 0xBADC0FFE);
     let (conn, hs1) = nodes[0].connect("bob.example", Some([7u8; 32])).unwrap();
     let hs2 = nodes[1].on_datagram(&hs1, 0);
-    nodes[0].on_datagram(&hs2[0], 0);
+    for confirm in nodes[0].on_datagram(&hs2[0], 0) {
+        nodes[1].on_datagram(&confirm, 0);
+    }
     assert!(nodes[0].is_open(conn) && nodes[1].is_open(conn));
 
     // ---- replay: each flow direction is its own stream, chunked per trace packet ----

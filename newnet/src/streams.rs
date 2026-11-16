@@ -7,6 +7,7 @@ pub const FRAME_STREAM: u8 = 0;
 pub const FRAME_ACK: u8 = 1;
 pub const FRAME_DGRAM: u8 = 2;
 pub const FRAME_CLOSE: u8 = 3;
+pub const FRAME_PING: u8 = 4;
 
 pub const MAX_SACKS: usize = 8;
 pub const CHUNK: usize = 1100;
@@ -87,6 +88,7 @@ pub fn decode_frame(b: &[u8]) -> Result<Frame, FrameError> {
             Ok(Frame { ftype, id, off: 0, cum: 0, sacks: vec![], data: b[5..].to_vec() })
         }
         FRAME_CLOSE => Ok(Frame { ftype, id, off: 0, cum: 0, sacks: vec![], data: vec![] }),
+        FRAME_PING => Ok(Frame { ftype, id, off: 0, cum: 0, sacks: vec![], data: vec![] }),
         _ => Err(FrameError::BadType),
     }
 }

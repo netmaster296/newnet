@@ -22,7 +22,8 @@ fn handshake_roundtrip_opens_both_sides() {
     let hs2s = b.on_datagram(&hs1, 1);
     assert_eq!(hs2s.len(), 1, "responder replies with msg2");
     let outs = a.on_datagram(&hs2s[0], 1);
-    assert!(outs.is_empty());
+    assert_eq!(outs.len(), 1, "initiator confirms its keys with one packet");
+    assert!(b.on_datagram(&outs[0], 1).is_empty());
     assert!(a.is_open(conn), "initiator open: {:?}", a.logs);
     assert!(b.is_open(conn), "responder open");
     assert_eq!(a.sessions[&conn].transcript, b.sessions[&conn].transcript);
@@ -163,7 +164,9 @@ fn replayed_hs1_cannot_disturb_a_live_session() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect("bob", Some([8u8; 32])).unwrap();
     let hs2 = b.on_datagram(&hs1, 1);
-    a.on_datagram(&hs2[0], 1);
+    for confirm in a.on_datagram(&hs2[0], 1) {
+        b.on_datagram(&confirm, 1);
+    }
     assert!(a.is_open(conn) && b.is_open(conn));
     let outs = b.on_datagram(&hs1, 2); // attacker replays the captured HS1
     assert!(outs.is_empty(), "conn already known: HS1 rejected, no reset");
@@ -178,35 +181,38 @@ fn replayed_hs1_cannot_disturb_a_live_session() {
 }
 
 #[test]
-fn lost_hs2_escalates_to_a_new_conn_and_reaps_the_old_one() {
+fn lost_hs2_opens_the_original_conn() {
     let (mut a, mut b) = pair();
+    // A lost msg2 no longer needs a second conn id: the responder answers the
+    // identical HS1 from its cache, and the original conn opens on both sides.
     let (c0, hs1) = a.connect_at("bob", Some([11u8; 32]), 0).unwrap();
     b.on_datagram(&hs1, 1); // responder's msg2 "lost": never delivered to a
-    let mut opened_conn = None;
     for t in 1..=30 {
         for (_c, p) in a.tick_sessions(t, 2) {
-            let out = b.on_datagram(&p, t);
-            for o in out {
-                a.on_datagram(&o, t);
+            for o in b.on_datagram(&p, t) {
+                for confirm in a.on_datagram(&o, t) {
+                    b.on_datagram(&confirm, t);
+                }
             }
         }
-        if let Some(c) = a.sessions.keys().copied().find(|c| a.is_open(*c) && *c != c0) {
-            opened_conn = Some(c);
+        if a.is_open(c0) {
             break;
         }
     }
-    assert!(opened_conn.is_some(), "escalation must open a fresh conn");
-    for t in 21..=25 {
-        a.tick_sessions(t, 2);
-        b.tick_sessions(t, 2);
-    }
-    assert_eq!(b.sessions.len(), 1, "half-open responder session reaped, live one stays");
-}#[test]
+    assert!(a.is_open(c0) && b.is_open(c0), "the original conn opens");
+    assert_eq!(a.sessions.len(), 1);
+    assert_eq!(b.sessions.len(), 1);
+    assert_eq!(b.half_open_count(), 0);
+}
+
+#[test]
 fn close_frees_state_on_both_sides() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect("bob", Some([9u8; 32])).unwrap();
     let hs2 = b.on_datagram(&hs1, 1);
-    a.on_datagram(&hs2[0], 1);
+    for confirm in a.on_datagram(&hs2[0], 1) {
+        b.on_datagram(&confirm, 1);
+    }
     assert!(a.is_open(conn) && b.is_open(conn));
     let c = a.close(conn).expect("close frame");
     b.on_datagram(&c, 1);
