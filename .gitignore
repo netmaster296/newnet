@@ -1,0 +1,9 @@
+# Build output
+newnet/target/
+
+# Packet captures: large, and the MAWI and NETRESEC files are third-party
+# data that is not ours to redistribute. The synthetic ones regenerate from
+# traces/gen_trace.py and traces/gen2.py.
+traces/*.pcap
+traces/*.dump
+traces/*.gz
