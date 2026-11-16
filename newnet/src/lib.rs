@@ -8,6 +8,7 @@ pub mod link;
 pub mod naming;
 pub mod node;
 pub mod noise;
+pub mod noise_ik;
 pub mod pcap;
 pub mod session;
 pub mod streams;

@@ -9,7 +9,8 @@ pub const MAX_DATAGRAM: usize = 1200;
 pub const TYPE_HANDSHAKE1: u8 = 0;
 pub const TYPE_HANDSHAKE2: u8 = 1;
 pub const TYPE_DATA: u8 = 2;
-pub const TYPE_CLOSE: u8 = 3;
+// There is no cleartext close. A session ends with an authenticated CLOSE
+// frame inside a DATA packet; the header type only says how to demux.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
@@ -59,7 +60,7 @@ pub fn decode(buf: &[u8]) -> Result<Packet, WireError> {
     if buf[4] != VERSION {
         return Err(WireError::BadVersion);
     }
-    if !matches!(buf[5], TYPE_HANDSHAKE1 | TYPE_HANDSHAKE2 | TYPE_DATA | TYPE_CLOSE) {
+    if !matches!(buf[5], TYPE_HANDSHAKE1 | TYPE_HANDSHAKE2 | TYPE_DATA) {
         return Err(WireError::BadType);
     }
     let conn_id = u64::from_le_bytes(buf[6..14].try_into().unwrap());

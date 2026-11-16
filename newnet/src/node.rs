@@ -130,10 +130,6 @@ impl Node {
             wire::TYPE_HANDSHAKE1 => self.on_hs1(pkt, tick),
             wire::TYPE_HANDSHAKE2 => self.on_hs2(pkt),
             wire::TYPE_DATA => self.on_data(pkt, tick),
-            wire::TYPE_CLOSE => {
-                self.sessions.remove(&pkt.header.conn_id);
-                vec![]
-            }
             _ => vec![],
         }
     }
