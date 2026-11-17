@@ -1,22 +1,30 @@
 // udpfile: send one file from one process to another over a newnet session
-// on UDP. Usage:
+// on UDP. Real identities come from key files made by newnet-keys (spec 3.3):
+//   udpfile recv --identity <secret> --peers <peers> --listen <addr:port> --out <file> [--timeout-secs 30]
+//   udpfile send --identity <secret> --peers <peers> --peer <name> --to <addr:port> --file <file>
+// The lab seed flags remain for tests and work only if every address given
+// is loopback:
 //   udpfile recv --name bob --seed 2 --peer alice --peer-seed 1 --listen 127.0.0.1:4002 --out received.bin [--timeout-secs 30]
 //   udpfile send --name alice --seed 1 --peer bob --peer-seed 2 --to 127.0.0.1:4002 --file input.bin [--listen 127.0.0.1:0] [--timeout-secs 30]
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::exit;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use newnet::crypto::PeerRecord;
 use newnet::identity::Identity;
+use newnet::keyfile;
 use newnet::node::Node;
+use newnet::peerbook;
 use newnet::udp::UdpEndpoint;
 
 const MAX_FILE_BYTES: u64 = 1 << 30;
 
 fn usage() -> ! {
-    eprintln!("usage: udpfile recv --name <name> --seed <n> --peer <name> --peer-seed <n> --listen <addr:port> --out <file> [--timeout-secs <n>]");
+    eprintln!("usage: udpfile recv --identity <secret> --peers <peers> --listen <addr:port> --out <file> [--timeout-secs <n>]");
+    eprintln!("   or: udpfile send --identity <secret> --peers <peers> --peer <name> --to <addr:port> --file <file> [--listen <addr:port>] [--timeout-secs <n>]");
+    eprintln!("   or: udpfile recv --name <name> --seed <n> --peer <name> --peer-seed <n> --listen <addr:port> --out <file> [--timeout-secs <n>]");
     eprintln!("   or: udpfile send --name <name> --seed <n> --peer <name> --peer-seed <n> --to <addr:port> --file <file> [--listen <addr:port>] [--timeout-secs <n>]");
     exit(2);
 }
@@ -30,8 +38,10 @@ struct Opts {
     mode: String,
     name: String,
     seed: u64,
-    peer: String,
+    peer: Option<String>,
     peer_seed: u64,
+    identity: Option<PathBuf>,
+    peers: Option<PathBuf>,
     listen: Option<String>,
     out: Option<PathBuf>,
     file: Option<PathBuf>,
@@ -56,8 +66,10 @@ fn parse() -> Opts {
         mode: String::new(),
         name: String::new(),
         seed: 0,
-        peer: String::new(),
+        peer: None,
         peer_seed: 0,
+        identity: None,
+        peers: None,
         listen: None,
         out: None,
         file: None,
@@ -82,11 +94,13 @@ fn parse() -> Opts {
                 o.seed = val().parse().unwrap_or_else(|_| usage());
                 have_seed = true;
             }
-            "--peer" => o.peer = val(),
+            "--peer" => o.peer = Some(val()),
             "--peer-seed" => {
                 o.peer_seed = val().parse().unwrap_or_else(|_| usage());
                 have_peer_seed = true;
             }
+            "--identity" => o.identity = Some(PathBuf::from(val())),
+            "--peers" => o.peers = Some(PathBuf::from(val())),
             "--listen" => o.listen = Some(val()),
             "--out" => o.out = Some(PathBuf::from(val())),
             "--file" => o.file = Some(PathBuf::from(val())),
@@ -95,7 +109,25 @@ fn parse() -> Opts {
             _ => usage(),
         }
     }
-    if o.name.is_empty() || o.peer.is_empty() || !have_seed || !have_peer_seed {
+    // Two identity modes, never mixed: key files (spec 3.3) or lab seeds.
+    let seed_mode = have_seed || have_peer_seed;
+    let file_mode = o.identity.is_some() || o.peers.is_some();
+    if (seed_mode && !have_seed) || (have_seed && !have_peer_seed) {
+        usage();
+    }
+    if seed_mode && file_mode {
+        usage();
+    }
+    if file_mode && (o.identity.is_none() || o.peers.is_none()) {
+        usage();
+    }
+    if !file_mode && !seed_mode {
+        usage();
+    }
+    if !file_mode && (o.name.is_empty() || o.peer.is_none()) {
+        usage();
+    }
+    if o.mode == "send" && o.peer.is_none() {
         usage();
     }
     if o.mode == "recv" && (o.listen.is_none() || o.out.is_none()) {
@@ -110,21 +142,52 @@ fn parse() -> Opts {
     o
 }
 
-fn warn_lab_only(listen: &SocketAddr) {
+// Seed identities are lab identities: they work only if every address given
+// is loopback (spec step 7). Checked before anything is bound or read.
+fn check_seed_loopback(o: &Opts) {
+    if o.identity.is_some() {
+        return;
+    }
     eprintln!("LAB ONLY: identities are derived from numeric seeds");
-    if !listen.ip().is_loopback() {
-        eprintln!("WARNING: listening beyond loopback. This build has no handshake cookie; do not expose it to an untrusted network.");
+    let off_loopback = match &o.listen {
+        Some(s) => match s.parse::<SocketAddr>() {
+            Ok(a) => !a.ip().is_loopback(),
+            Err(_) => usage(),
+        },
+        None => false,
+    } || match &o.to {
+        Some(t) => !t.ip().is_loopback(),
+        None => false,
+    };
+    if off_loopback {
+        eprintln!("lab identities may only be used on loopback");
+        exit(2);
     }
 }
 
-fn node_with_peer(o: &Opts) -> Node {
+// The node's identity comes from the secret file (its name is the name in
+// the file), and its peers from the peers file: the file is the pin
+// (spec 3.3, 3.5). In seed mode the old numeric identities are used.
+fn node_from_opts(o: &Opts) -> Result<Node, String> {
+    if let Some(idpath) = &o.identity {
+        let kf = keyfile::load(idpath).map_err(|e| format!("cannot read the identity file {}: {e:?}", idpath.display()))?;
+        let mut node = Node::from_identity(&kf.name, Identity::from_secret(kf.secret));
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let (active, _expired) = peerbook::load_peers(&o.peers.clone().unwrap(), now)
+            .map_err(|e| format!("cannot read the peers file: {e:?}"))?;
+        for l in &active {
+            node.add_peer(l);
+        }
+        return Ok(node);
+    }
     let mut node = Node::new(&o.name, o.seed);
     let id = Identity::from_seed(o.peer_seed);
+    let peer = o.peer.clone().unwrap();
     node.records.insert(
-        o.peer.clone(),
-        PeerRecord { name: o.peer.clone(), ed: Some(id.ed_pub()), x: id.x_pub, expiry: u64::MAX },
+        peer.clone(),
+        PeerRecord { name: peer, ed: Some(id.ed_pub()), x: id.x_pub, expiry: u64::MAX },
     );
-    node
+    Ok(node)
 }
 
 fn timed_out(start: Instant, secs: u64) -> bool {
@@ -183,7 +246,7 @@ fn main() {
         },
         None => usage(),
     };
-    warn_lab_only(&listen);
+    check_seed_loopback(&o);
 
     if o.mode == "send" {
         let file = match &o.file {
@@ -209,7 +272,11 @@ fn main() {
             }
             d
         };
-        let mut ep = match UdpEndpoint::bind(node_with_peer(&o), &listen.to_string()) {
+        let node = match node_from_opts(&o) {
+            Ok(n) => n,
+            Err(msg) => fail(msg),
+        };
+        let mut ep = match UdpEndpoint::bind(node, &listen.to_string()) {
             Ok(e) => e,
             Err(e) => fail(format!("cannot bind {listen}: {e}")),
         };
@@ -217,21 +284,25 @@ fn main() {
             Some(t) => t,
             None => usage(),
         };
+        let peer = match &o.peer {
+            Some(p) => p.clone(),
+            None => usage(),
+        };
         // The conn id connect returned can die under a retry: the node starts
         // a fresh attempt under a new id. Follow the session by peer name
         // instead of holding the id.
-        if let Err(e) = ep.connect(&o.peer, to) {
-            fail(format!("cannot connect to {}: {e:?}", o.peer));
+        if let Err(e) = ep.connect(&peer, to) {
+            fail(format!("cannot connect to {peer}: {e:?}"));
         }
         let start = Instant::now();
         let conn = loop {
             if timed_out(start, o.timeout_secs) {
                 fail("timed out");
             }
-            if let Some(c) = ep.node.session_with(&o.peer) {
+            if let Some(c) = ep.node.session_with(&peer) {
                 break c;
             }
-            if !ep.node.is_connecting_to(&o.peer) {
+            if !ep.node.is_connecting_to(&peer) {
                 fail("peer did not answer");
             }
             match ep.poll() {
@@ -312,7 +383,11 @@ fn main() {
         None => usage(),
     };
     probe_out(&out);
-    let mut ep = match UdpEndpoint::bind(node_with_peer(&o), &listen.to_string()) {
+    let node = match node_from_opts(&o) {
+        Ok(n) => n,
+        Err(msg) => fail(msg),
+    };
+    let mut ep = match UdpEndpoint::bind(node, &listen.to_string()) {
         Ok(e) => e,
         Err(e) => fail(format!("cannot bind {listen}: {e}")),
     };
@@ -321,6 +396,13 @@ fn main() {
     let mut buf: Vec<u8> = Vec::new();
     loop {
         if timed_out(start, o.timeout_secs) {
+            // Log the handshake verdict: an unknown or mismatched key shows
+            // here as auth_fails >= 1 while nothing else happened.
+            eprintln!(
+                "receiver stats: auth_fails={} sessions={}",
+                ep.node.stats.auth_fails,
+                ep.node.sessions.len()
+            );
             fail("timed out");
         }
         match ep.poll() {
@@ -332,12 +414,18 @@ fn main() {
             Err(e) => fail(format!("poll failed: {e}")),
         }
         if conn.is_none() {
+            // With key files the peers file is the allowlist: any session
+            // that opened is one the file authorized, so the receiver takes
+            // the first one. Seed mode keeps matching by the given name.
             conn = ep
                 .node
                 .sessions
                 .keys()
                 .copied()
-                .find(|c| ep.node.peer_of(*c) == Some(o.peer.as_str()));
+                .find(|c| match &o.peer {
+                    Some(p) => ep.node.peer_of(*c) == Some(p.as_str()),
+                    None => true,
+                });
         }
         if let Some(c) = conn {
             if ep.node.peer_of(c).is_none() {
