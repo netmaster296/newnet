@@ -4,7 +4,11 @@
 // resets the idle clock.
 
 use newnet::crypto::PeerRecord;
+use newnet::link::ADDR_ANY;
 use newnet::node::Node;
+
+mod common;
+use common::complete_cookie_round;
 use newnet::session::{IDLE_TTL, KEEPALIVE_AFTER};
 use newnet::streams::Frame;
 
@@ -18,9 +22,10 @@ fn pair() -> (Node, Node) {
     (a, b)
 }
 
-// Full three-datagram open through the nodes: HS1, HS2, PING, reply.
+// Full open through the nodes, cookie round included: HS1, COOKIE, HS1, HS2, PING, reply.
 fn open(a: &mut Node, b: &mut Node, eph: u8) -> u64 {
     let (conn, hs1) = a.connect("bob", Some([eph; 32])).unwrap();
+    let hs1 = complete_cookie_round(a, b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 1);
     assert_eq!(hs2.len(), 1, "responder answers: {:?}", b.stats);
     let confirm = a.on_datagram(&hs2[0], 1);

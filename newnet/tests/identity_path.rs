@@ -4,7 +4,11 @@
 
 use newnet::crypto::PeerRecord;
 use newnet::identity::IdentityError;
+use newnet::link::ADDR_ANY;
 use newnet::node::{ConnectError, Node};
+
+mod common;
+use common::complete_cookie_round;
 
 fn pair() -> (Node, Node) {
     let mut a = Node::new("alice", 0xA11CE);
@@ -32,6 +36,7 @@ fn expired_record_is_refused_by_the_responder() {
     let (mut a, mut b) = pair();
     b.records.get_mut("alice").unwrap().expiry = 5;
     let (_, hs1) = a.connect_at("bob", None, 0).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let out = b.on_datagram(&hs1, 10);
     assert!(out.is_empty());
     assert_eq!(b.half_open_count(), 0);
@@ -42,6 +47,7 @@ fn expired_record_is_refused_by_the_responder() {
 fn responder_pins_on_first_handshake_and_refuses_a_changed_key() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect("bob", Some([1u8; 32])).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 1);
     assert_eq!(hs2.len(), 1);
     let confirm = a.on_datagram(&hs2[0], 1);
@@ -63,6 +69,7 @@ fn responder_pins_on_first_handshake_and_refuses_a_changed_key() {
     );
     let (_, hs1_2) = a2.connect("bob", None).unwrap();
     let before = b.stats.auth_fails;
+    let hs1_2 = complete_cookie_round(&mut a2, &mut b, hs1_2, ADDR_ANY);
     let out = b.on_datagram(&hs1_2, 2);
     assert!(out.is_empty());
     assert_eq!(b.half_open_count(), 0);

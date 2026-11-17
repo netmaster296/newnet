@@ -6,9 +6,13 @@ use std::time::Duration;
 
 use newnet::attacks;
 use newnet::crypto::PeerRecord;
+use newnet::link::ADDR_ANY;
 use newnet::node::{BUDGET_EPOCH_TICKS, HALF_OPEN_TTL, Node};
 use newnet::session::IDLE_TTL;
 use newnet::udp::{TICK_MS, TIMEOUT_TICKS, UdpEndpoint};
+
+mod common;
+use common::cookie_for_handbuilt;
 
 #[test]
 fn idle_ttl_is_twelve_seconds() {
@@ -35,14 +39,17 @@ fn budget_epoch_is_twenty_ticks() {
     let mut rng = attacks::Rng::new(7);
     for i in 0..4u64 {
         let p = attacks::garbage_handshake(&mut rng, 4000 + i);
+        let p = cookie_for_handbuilt(&mut b, &p, ADDR_ANY, 0);
         b.on_datagram(&p, 0);
     }
     assert_eq!(b.stats.dh_count, 8, "the first four handshakes of an epoch do DH work");
     let fifth = attacks::garbage_handshake(&mut rng, 4004);
+    let fifth = cookie_for_handbuilt(&mut b, &fifth, ADDR_ANY, 19);
     b.on_datagram(&fifth, 19);
     assert_eq!(b.stats.handshake_dropped_budget, 1, "the 5th at tick 19 is still in epoch 0");
     assert_eq!(b.stats.dh_count, 8, "a budget-dropped handshake costs no key exchange");
     let sixth = attacks::garbage_handshake(&mut rng, 4005);
+    let sixth = cookie_for_handbuilt(&mut b, &sixth, ADDR_ANY, BUDGET_EPOCH_TICKS);
     b.on_datagram(&sixth, BUDGET_EPOCH_TICKS);
     assert_eq!(b.stats.handshake_dropped_budget, 1, "the handshake at tick 20 opens a new epoch");
     assert_eq!(b.stats.dh_count, 10, "the new epoch admits the next handshake");

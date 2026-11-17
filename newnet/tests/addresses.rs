@@ -2,9 +2,13 @@
 // and follow the peer address, and the hub can name the sender.
 
 use newnet::crypto::PeerRecord;
-use newnet::link::Hub;
+use newnet::link::{Hub, ADDR_ANY};
 use newnet::node::Node;
 use newnet::streams::Frame;
+use newnet::wire;
+
+mod common;
+use common::{complete_cookie_round, cookie_for_handbuilt};
 
 fn pair() -> (Node, Node) {
     let mut a = Node::new("alice", 0xA11CE);
@@ -22,9 +26,11 @@ fn junk_from_one_source_does_not_starve_another() {
     let mut rng = newnet::attacks::Rng::new(7);
     for i in 0..10u64 {
         let p = newnet::attacks::garbage_handshake(&mut rng, 9000 + i);
+        let p = cookie_for_handbuilt(&mut b, &p, 7, 5);
         b.on_datagram_from(7, &p, 5);
     }
     let (_conn, hs1) = a.connect("bob", Some([1u8; 32])).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, 3);
     let hs2 = b.on_datagram_from(3, &hs1, 5);
     assert_eq!(hs2.len(), 1, "a fresh source gets its handshake through");
     assert_eq!(b.stats.handshake_dropped_budget, 6);
@@ -36,9 +42,11 @@ fn the_old_entry_point_still_has_one_shared_budget() {
     let mut rng = newnet::attacks::Rng::new(7);
     for i in 0..10u64 {
         let p = newnet::attacks::garbage_handshake(&mut rng, 9000 + i);
+        let p = cookie_for_handbuilt(&mut b, &p, ADDR_ANY, 5);
         b.on_datagram(&p, 5);
     }
     let (_conn, hs1) = a.connect("bob", Some([2u8; 32])).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     assert!(b.on_datagram(&hs1, 5).is_empty(), "unknown sources share one bucket");
 }
 
@@ -48,6 +56,7 @@ fn a_global_cap_bounds_the_work_per_tick() {
     let mut rng = newnet::attacks::Rng::new(11);
     for i in 0..100u64 {
         let p = newnet::attacks::garbage_handshake(&mut rng, 20000 + i);
+        let p = cookie_for_handbuilt(&mut b, &p, 1000 + i as u32, 9);
         b.on_datagram_from(1000 + i as u32, &p, 9);
     }
     assert!(b.stats.dh_count <= 2 * 64, "the tick is capped globally: {} DH", b.stats.dh_count);
@@ -58,7 +67,14 @@ fn a_global_cap_bounds_the_work_per_tick() {
 fn sessions_learn_and_follow_the_peer_address() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect_to("bob", 2, Some([3u8; 32]), 1).unwrap();
-    let hs2 = b.on_datagram_from(1, &hs1, 1);
+    // The attempt is addressed to 2, so its COOKIE must come from 2 (spec 4.5):
+    // the shared helper's unknown-source delivery would be ignored.
+    let ck = b.on_datagram_from(1, &hs1, 1);
+    assert_eq!(ck.len(), 1, "the zero-cookie HS1 is answered with one COOKIE");
+    assert_eq!(wire::decode(&ck[0]).unwrap().header.ptype, wire::TYPE_COOKIE, "the first reply is the COOKIE");
+    let hs1 = a.on_datagram_from(2, &ck[0], 1);
+    assert_eq!(hs1.len(), 1, "the attempt rebuilds into a cookie-bearing HS1");
+    let hs2 = b.on_datagram_from(1, &hs1[0], 1);
     assert_eq!(hs2.len(), 1);
     let confirm = a.on_datagram_from(2, &hs2[0], 1);
     assert_eq!(confirm.len(), 1);

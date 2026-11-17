@@ -2,7 +2,11 @@
 // application can ask who is on the other end of a conn.
 
 use newnet::crypto::PeerRecord;
+use newnet::link::ADDR_ANY;
 use newnet::node::Node;
+
+mod common;
+use common::complete_cookie_round;
 
 fn pair() -> (Node, Node) {
     let mut a = Node::new("alice", 0xA11CE);
@@ -18,6 +22,7 @@ fn pair() -> (Node, Node) {
 fn both_sides_know_the_peer_name() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect("bob", Some([1; 32])).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 1);
     assert_eq!(hs2.len(), 1, "responder answers: {:?}", b.stats);
     let confirm = a.on_datagram(&hs2[0], 1);
@@ -47,7 +52,13 @@ fn session_with_finds_the_session_after_a_retry() {
     let (retry_conn, hs1) = last.expect("the retry datagram was seen");
     assert_ne!(retry_conn, conn0, "the second attempt uses a new conn id");
 
-    let hs2 = b.on_datagram(&hs1, 9);
+    // The retry still has a zero cookie: answer it, rebuild, deliver the
+    // cookie-bearing copy.
+    let ck = b.on_datagram(&hs1, 9);
+    assert_eq!(ck.len(), 1, "the retry is answered with one COOKIE: {:?}", b.stats);
+    let hs1 = a.on_datagram(&ck[0], 9);
+    assert_eq!(hs1.len(), 1, "the retry rebuilds with the cookie");
+    let hs2 = b.on_datagram(&hs1[0], 9);
     assert_eq!(hs2.len(), 1, "responder answers the retry: {:?}", b.stats);
     let confirm = a.on_datagram(&hs2[0], 9);
     assert_eq!(confirm.len(), 1, "initiator proves its keys with one packet");
@@ -67,6 +78,7 @@ fn session_with_finds_the_session_after_a_retry() {
 fn a_half_open_or_unknown_conn_has_no_peer() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect("bob", Some([2; 32])).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 1);
     assert_eq!(hs2.len(), 1, "responder answers: {:?}", b.stats);
     // HS1 has reached b and nothing else: b holds only a half-open entry.

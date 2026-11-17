@@ -1,7 +1,8 @@
 // Step 4 (A3 4a): the return-routability cookie on both sides, behind the
 // require_cookie switch. Every test here turns the switch on the responder
-// side; the default (off) keeps every other test on the v1 four-datagram
-// flow. Order rules tested are spec 4.4 (responder) and 4.5 (initiator).
+// side; since 4b the switch is on by default, so every other test does the
+// cookie round too. Order rules tested are spec 4.4 (responder) and 4.5
+// (initiator).
 
 use newnet::crypto::PeerRecord;
 use newnet::link::Hub;

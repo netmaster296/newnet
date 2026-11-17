@@ -252,8 +252,19 @@ fn main() {
         nodes[me].records.insert(rec.name.clone(), rec);
     }
     let mut hub = Hub::new(2, o.loss as u32, o.reorder as u32, 0xBADC0FFE);
+    // Hand-driven handshake: the cookie round, inline (no test helper here).
+    // HS1 (zero cookie) -> COOKIE -> HS1 (cookie) -> HS2 -> confirm.
     let (conn, hs1) = nodes[0].connect("bob.example", Some([7u8; 32])).unwrap();
-    let hs2 = nodes[1].on_datagram(&hs1, 0);
+    let ck = nodes[1].on_datagram(&hs1, 0);
+    assert_eq!(ck.len(), 1, "the zero-cookie HS1 gets exactly one COOKIE");
+    assert_eq!(
+        newnet::wire::decode(&ck[0]).expect("the COOKIE reply decodes").header.ptype,
+        newnet::wire::TYPE_COOKIE,
+        "the first reply must be a COOKIE"
+    );
+    let hs1b = nodes[0].on_datagram(&ck[0], 0);
+    assert_eq!(hs1b.len(), 1, "the initiator answers a COOKIE with the rebuilt HS1");
+    let hs2 = nodes[1].on_datagram(&hs1b[0], 0);
     for confirm in nodes[0].on_datagram(&hs2[0], 0) {
         nodes[1].on_datagram(&confirm, 0);
     }

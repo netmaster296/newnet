@@ -6,7 +6,11 @@
 use std::collections::HashSet;
 
 use newnet::crypto::PeerRecord;
+use newnet::link::ADDR_ANY;
 use newnet::node::Node;
+
+mod common;
+use common::complete_cookie_round;
 
 fn pair() -> (Node, Node) {
     let mut a = Node::new("alice", 0xA11CE);
@@ -18,9 +22,10 @@ fn pair() -> (Node, Node) {
     (a, b)
 }
 
-// Full three-datagram open through the nodes: HS1, HS2, PING, reply.
+// Full open through the nodes, cookie round included: HS1, COOKIE, HS1, HS2, PING, reply.
 fn open(a: &mut Node, b: &mut Node, eph: u8) -> u64 {
     let (conn, hs1) = a.connect("bob", Some([eph; 32])).unwrap();
+    let hs1 = complete_cookie_round(a, b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 1);
     assert_eq!(hs2.len(), 1, "responder answers: {:?}", b.stats);
     let confirm = a.on_datagram(&hs2[0], 1);
@@ -77,6 +82,7 @@ fn a_restarted_initiator_needs_a_clock_based_stamp() {
     a2.records.insert("bob".into(), PeerRecord { name: rec_b.name.clone(), ed: rec_b.ed, x: rec_b.x, expiry: rec_b.expiry });
     let (_c2, hs1) = a2.connect("bob", None).unwrap();
     let before = b.stats.hs_replay_dropped;
+    let hs1 = complete_cookie_round(&mut a2, &mut b, hs1, ADDR_ANY);
     let out = b.on_datagram(&hs1, 2);
     assert!(out.is_empty(), "Bob answered the restarted alice's low-stamp HS1");
     assert_eq!(b.stats.hs_replay_dropped, before + 1);
@@ -86,6 +92,7 @@ fn a_restarted_initiator_needs_a_clock_based_stamp() {
     a3.records.insert("bob".into(), PeerRecord { name: rec_b.name, ed: rec_b.ed, x: rec_b.x, expiry: rec_b.expiry });
     a3.set_stamp_base(2_000);
     let (_c3, hs1) = a3.connect("bob", None).unwrap();
+    let hs1 = complete_cookie_round(&mut a3, &mut b, hs1, ADDR_ANY);
     let out = b.on_datagram(&hs1, 3);
     assert_eq!(out.len(), 1, "Bob must answer the restarted alice once her stamp is ahead: {:?}", b.stats);
 }

@@ -141,13 +141,13 @@ impl Node {
             budget_total: 0,
             last_tick: 0,
             cookies: CookieKeys::new(0),
-            require_cookie: false,
+            require_cookie: true,
         }
     }
 
-    // Step 4a switch. False (the default until 4b): the responder treats
+    // Step 4a switch, on by default since 4b. False: the responder treats
     // every HANDSHAKE1 as if its cookie were valid. The initiator side of
-    // the COOKIE datagram is always live.
+    // the COOKIE datagram is always live. 4c removes the switch.
     pub fn set_require_cookie(&mut self, on: bool) {
         self.require_cookie = on;
     }

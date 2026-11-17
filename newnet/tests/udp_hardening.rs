@@ -11,6 +11,9 @@ use newnet::session::MAX_IN_FLIGHT;
 use newnet::streams::{Frame, FRAME_STREAM};
 use newnet::udp::{UdpEndpoint, BURST, MAX_RECV_PER_POLL};
 
+mod common;
+use common::complete_cookie_round;
+
 fn pair_with_b_capacity(max_peers: usize) -> (UdpEndpoint, UdpEndpoint) {
     let mut a = Node::new("alice", 0xA11CE);
     let mut b = Node::new("bob", 0xB0B);
@@ -228,6 +231,7 @@ fn mem_pair() -> (Node, Node) {
 
 fn open_mem(a: &mut Node, b: &mut Node, eph: u8) -> u64 {
     let (conn, hs1) = a.connect("bob", Some([eph; 32])).unwrap();
+    let hs1 = complete_cookie_round(a, b, hs1, newnet::link::ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 1);
     assert_eq!(hs2.len(), 1, "responder answers: {:?}", b.stats);
     let confirm = a.on_datagram(&hs2[0], 1);
