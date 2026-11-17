@@ -1,14 +1,17 @@
 pub mod attacks;
 pub mod content;
+pub mod cookie;
 pub mod crypto;
 pub mod datagrams;
 pub mod identity;
+pub mod keyfile;
 pub mod legacy;
 pub mod link;
 pub mod naming;
 pub mod node;
 pub mod noise_ik;
 pub mod pcap;
+pub mod peerbook;
 pub mod session;
 pub mod streams;
 pub mod udp;

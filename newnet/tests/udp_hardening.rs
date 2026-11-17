@@ -7,14 +7,18 @@ use std::time::{Duration, Instant};
 
 use newnet::crypto::PeerRecord;
 use newnet::node::Node;
+use newnet::session::MAX_IN_FLIGHT;
 use newnet::streams::{Frame, FRAME_STREAM};
 use newnet::udp::{UdpEndpoint, BURST, MAX_RECV_PER_POLL};
+
+mod common;
+use common::complete_cookie_round;
 
 fn pair_with_b_capacity(max_peers: usize) -> (UdpEndpoint, UdpEndpoint) {
     let mut a = Node::new("alice", 0xA11CE);
     let mut b = Node::new("bob", 0xB0B);
-    let rec_b = PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX };
-    let rec_a = PeerRecord { name: "alice".into(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX };
+    let rec_b = PeerRecord { name: "bob".into(), ed: Some(b.ident.ed_pub()), x: b.ident.x_pub, expiry: u64::MAX };
+    let rec_a = PeerRecord { name: "alice".into(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX };
     a.records.insert("bob".into(), rec_b);
     b.records.insert("alice".into(), rec_a);
     let ea = UdpEndpoint::bind(a, "127.0.0.1:0").unwrap();
@@ -183,19 +187,33 @@ fn sends_are_paced_by_time_not_by_poll_calls() {
     let conn = a.connect("bob", b.local_addr()).unwrap();
     pump(&mut a, &mut b, |a, b| a.node.is_open(conn) && b.node.is_open(conn), 10);
 
-    let data: Vec<u8> = (0..400_000u64).map(|i| (i.wrapping_mul(31).wrapping_add(i / 1000)) as u8).collect();
+    let data: Vec<u8> = (0..5_000_000u64).map(|i| (i.wrapping_mul(31).wrapping_add(i / 1000)) as u8).collect();
     a.send_bytes(conn, 1, &data);
 
-    let q0 = a.queued();
+    // A fixed 200 ms window of tight poll rounds on a only. b is left
+    // unpolled: no ACKs come back, nothing is retransmitted (the
+    // retransmit timeout is 500 ticks), and the outgoing queue is pure
+    // supply. send_bytes has just released MAX_IN_FLIGHT datagrams into
+    // that queue, so every datagram that leaves a shows up as a queue
+    // drop. Epoch pacing releases at most BURST per 20-tick epoch, so at
+    // most (window/20 + 2) bursts can leave in the window; a per-tick cap
+    // dumps the whole MAX_IN_FLIGHT supply in the first rounds, far above
+    // the bound's two-epoch slop.
+    let supply = a.queued();
+    assert_eq!(supply, MAX_IN_FLIGHT, "send_bytes must release exactly MAX_IN_FLIGHT datagrams into the outgoing queue");
     let t0 = a.now();
-    // Tight loop inside one tick: b is never polled, nothing sleeps.
-    while a.now() == t0 {
+    while a.now() < t0 + 200 {
         a.poll().unwrap();
     }
+    let window = a.now() - t0;
+    let sent = supply - a.queued();
     assert!(
-        q0 - a.queued() <= 2 * BURST,
-        "one tick sent {} datagrams: more than a burst's worth twice",
-        q0 - a.queued()
+        sent > 2 * BURST,
+        "only {sent} datagrams left a in {window} ms: the check has no signal"
+    );
+    assert!(
+        sent <= ((window / 20) as usize + 2) * BURST,
+        "a sent {sent} datagrams over {window} ticks: more than BURST per 20-tick pacing epoch",
     );
 }
 
@@ -204,8 +222,8 @@ fn sends_are_paced_by_time_not_by_poll_calls() {
 fn mem_pair() -> (Node, Node) {
     let mut a = Node::new("alice", 0xA11CE);
     let mut b = Node::new("bob", 0xB0B);
-    let rec_b = PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX };
-    let rec_a = PeerRecord { name: "alice".into(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX };
+    let rec_b = PeerRecord { name: "bob".into(), ed: Some(b.ident.ed_pub()), x: b.ident.x_pub, expiry: u64::MAX };
+    let rec_a = PeerRecord { name: "alice".into(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX };
     a.records.insert("bob".into(), rec_b);
     b.records.insert("alice".into(), rec_a);
     (a, b)
@@ -213,6 +231,7 @@ fn mem_pair() -> (Node, Node) {
 
 fn open_mem(a: &mut Node, b: &mut Node, eph: u8) -> u64 {
     let (conn, hs1) = a.connect("bob", Some([eph; 32])).unwrap();
+    let hs1 = complete_cookie_round(a, b, hs1, newnet::link::ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 1);
     assert_eq!(hs2.len(), 1, "responder answers: {:?}", b.stats);
     let confirm = a.on_datagram(&hs2[0], 1);

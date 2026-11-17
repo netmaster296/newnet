@@ -11,8 +11,8 @@ use newnet::udp::UdpEndpoint;
 fn pair() -> (UdpEndpoint, UdpEndpoint) {
     let mut a = Node::new("alice", 0xA11CE);
     let mut b = Node::new("bob", 0xB0B);
-    let rec_b = PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX };
-    let rec_a = PeerRecord { name: "alice".into(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX };
+    let rec_b = PeerRecord { name: "bob".into(), ed: Some(b.ident.ed_pub()), x: b.ident.x_pub, expiry: u64::MAX };
+    let rec_a = PeerRecord { name: "alice".into(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX };
     a.records.insert("bob".into(), rec_b);
     b.records.insert("alice".into(), rec_a);
     let ea = UdpEndpoint::bind(a, "127.0.0.1:0").unwrap();
@@ -80,7 +80,7 @@ fn a_restarted_initiator_reconnects() {
     let mut a2 = Node::new("alice", 0xA11CE);
     a2.records.insert(
         "bob".into(),
-        PeerRecord { name: "bob".into(), ed: b.node.ident.ed_pub(), x: b.node.ident.x_pub, expiry: u64::MAX },
+        PeerRecord { name: "bob".into(), ed: Some(b.node.ident.ed_pub()), x: b.node.ident.x_pub, expiry: u64::MAX },
     );
     let mut a = UdpEndpoint::bind(a2, "127.0.0.1:0").unwrap();
     let conn2 = a.connect("bob", b.local_addr()).unwrap();

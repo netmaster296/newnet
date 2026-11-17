@@ -1,15 +1,19 @@
 // Integration: handshake opens, pins enforce, attacks stay cheap.
 
 use newnet::crypto::PeerRecord;
+use newnet::link::ADDR_ANY;
 use newnet::naming::{self, NameRecord};
 use newnet::node::Node;
+
+mod common;
+use common::{complete_cookie_round, cookie_for_handbuilt};
 
 fn pair() -> (Node, Node) {
     let a = Node::new("alice", 0xA11CE);
     let b = Node::new("bob", 0xB0B);
     let (mut a, mut b) = (a, b);
-    let rec_b = PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX };
-    let rec_a = PeerRecord { name: "alice".into(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX };
+    let rec_b = PeerRecord { name: "bob".into(), ed: Some(b.ident.ed_pub()), x: b.ident.x_pub, expiry: u64::MAX };
+    let rec_a = PeerRecord { name: "alice".into(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX };
     a.records.insert("bob".into(), rec_b);
     b.records.insert("alice".into(), rec_a);
     (a, b)
@@ -19,6 +23,7 @@ fn pair() -> (Node, Node) {
 fn handshake_roundtrip_opens_both_sides() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect("bob", Some([1u8; 32])).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2s = b.on_datagram(&hs1, 1);
     assert_eq!(hs2s.len(), 1, "responder replies with msg2");
     let outs = a.on_datagram(&hs2s[0], 1);
@@ -47,9 +52,10 @@ fn wrong_pinned_key_fails_handshake() {
     let wrong = Node::new("ghost", 0x6057);
     b.records.insert(
         "alice".into(),
-        PeerRecord { name: "alice".into(), ed: wrong.ident.ed_pub(), x: wrong.ident.x_pub, expiry: u64::MAX },
+        PeerRecord { name: "alice".into(), ed: Some(wrong.ident.ed_pub()), x: wrong.ident.x_pub, expiry: u64::MAX },
     );
     let (_conn, hs1) = a.connect("bob", Some([2u8; 32])).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2s = b.on_datagram(&hs1, 1);
     assert!(hs2s.is_empty(), "no session for a claim whose record does not match");
     assert_eq!(b.stats.auth_fails, 1);
@@ -80,6 +86,7 @@ fn handshake_budget_caps_dh_per_tick() {
     let d0 = b.stats.dh_count;
     for i in 0..10u64 {
         let p = newnet::attacks::garbage_handshake(&mut rng, 9000 + i);
+        let p = cookie_for_handbuilt(&mut b, &p, ADDR_ANY, 5);
         b.on_datagram(&p, 5);
     }
     assert!(b.stats.dh_count - d0 <= 4 * 2, "at most 4 attempts per tick (2 DH each before payload check fails)");
@@ -100,6 +107,7 @@ fn legacy_on_hub_allocates_nothing() {
 fn streams_are_independent_no_head_of_line_blocking() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect("bob", Some([5u8; 32])).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 1);
     a.on_datagram(&hs2[0], 1);
     assert!(a.is_open(conn));
@@ -147,9 +155,14 @@ fn handshake_retransmits_in_protocol_no_app_retry() {
     let mut opened = false;
     for t in 1..=10 {
         for (_, p) in a.tick_sessions(t, 2) {
-            let out = b.on_datagram(&p, t);
-            for o in out {
-                a.on_datagram(&o, t);
+            // One round through b now includes the cookie: b's COOKIE answer
+            // rebuilds a's datagram, and the rebuilt copy goes back to b in
+            // the same round.
+            let mut queue = vec![p];
+            while let Some(d) = queue.pop() {
+                for o in b.on_datagram(&d, t) {
+                    queue.extend(a.on_datagram(&o, t));
+                }
             }
         }
         if a.is_open(conn) {
@@ -165,12 +178,13 @@ fn handshake_retransmits_in_protocol_no_app_retry() {
 fn replayed_hs1_cannot_disturb_a_live_session() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect("bob", Some([8u8; 32])).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 1);
     for confirm in a.on_datagram(&hs2[0], 1) {
         b.on_datagram(&confirm, 1);
     }
     assert!(a.is_open(conn) && b.is_open(conn));
-    let outs = b.on_datagram(&hs1, 2); // attacker replays the captured HS1
+    let outs = b.on_datagram(&hs1, 2); // attacker replays the captured cookie-bearing HS1
     assert!(outs.is_empty(), "conn already known: HS1 rejected, no reset");
     assert_eq!(b.stats.auth_fails, 1);
     assert_eq!(b.stats.sessions_allocated, 1);
@@ -188,12 +202,16 @@ fn lost_hs2_opens_the_original_conn() {
     // A lost msg2 no longer needs a second conn id: the responder answers the
     // identical HS1 from its cache, and the original conn opens on both sides.
     let (c0, hs1) = a.connect_at("bob", Some([11u8; 32]), 0).unwrap();
-    b.on_datagram(&hs1, 1); // responder's msg2 "lost": never delivered to a
+    b.on_datagram(&hs1, 1); // responder's cookie answer "lost": never delivered to a
     for t in 1..=30 {
         for (_c, p) in a.tick_sessions(t, 2) {
-            for o in b.on_datagram(&p, t) {
-                for confirm in a.on_datagram(&o, t) {
-                    b.on_datagram(&confirm, t);
+            // One round through b includes the cookie: b's COOKIE answer
+            // rebuilds a's datagram, and the rebuilt copy goes back to b in
+            // the same round.
+            let mut queue = vec![p];
+            while let Some(d) = queue.pop() {
+                for o in b.on_datagram(&d, t) {
+                    queue.extend(a.on_datagram(&o, t));
                 }
             }
         }
@@ -211,6 +229,7 @@ fn lost_hs2_opens_the_original_conn() {
 fn close_frees_state_on_both_sides() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect("bob", Some([9u8; 32])).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 1);
     for confirm in a.on_datagram(&hs2[0], 1) {
         b.on_datagram(&confirm, 1);

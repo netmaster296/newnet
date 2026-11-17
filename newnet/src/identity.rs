@@ -42,6 +42,18 @@ impl Identity {
         Identity { ed_sign, x_static, x_pub }
     }
 
+    // A key file's secret is the whole identity (spec 3.1): the X25519 static
+    // is the secret itself, and the Ed25519 half is derived from it with
+    // HKDF-SHA256 so the struct stays whole. The real path never signs with
+    // the Ed25519 key.
+    pub fn from_secret(secret: [u8; 32]) -> Self {
+        let ed_seed = crate::crypto::hkdf1(&secret, b"NEWNET2-ED25519");
+        let ed_sign = SigningKey::from_bytes(&ed_seed);
+        let x_static = StaticSecret::from(secret);
+        let x_pub = XPublic::from(&x_static);
+        Identity { ed_sign, x_static, x_pub }
+    }
+
     pub fn ed_pub(&self) -> VerifyingKey {
         self.ed_sign.verifying_key()
     }
@@ -180,6 +192,24 @@ impl PinStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_secret_is_deterministic_and_public_matches() {
+        let secret = [7u8; 32];
+        let a = Identity::from_secret(secret);
+        let b = Identity::from_secret(secret);
+        assert_eq!(a.x_static.to_bytes(), secret, "the secret is used as it stands");
+        assert_eq!(a.x_pub.as_bytes(), b.x_pub.as_bytes(), "one secret, one public key");
+        assert_eq!(a.ed_pub().as_bytes(), b.ed_pub().as_bytes(), "and one derived Ed25519 key");
+        // The public key is X25519(secret, basepoint).
+        let expect = x25519_dalek::x25519(secret, x25519_dalek::X25519_BASEPOINT_BYTES);
+        assert_eq!(*a.x_pub.as_bytes(), expect);
+        // The Ed25519 half is derived from the secret, not the secret itself.
+        assert_ne!(a.ed_pub().as_bytes(), &secret);
+        let other = Identity::from_secret([8u8; 32]);
+        assert_ne!(other.x_pub.as_bytes(), a.x_pub.as_bytes());
+        assert_ne!(other.ed_pub().as_bytes(), a.ed_pub().as_bytes());
+    }
 
     #[test]
     fn cert_round_trip_and_tamper() {

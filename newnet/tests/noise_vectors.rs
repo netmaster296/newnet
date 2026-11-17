@@ -111,7 +111,7 @@ fn a_forged_msg2_does_not_poison_the_initiator() {
 #[test]
 fn prologue_binds_the_connection_id() {
     assert_ne!(noise_ik::prologue(1), noise_ik::prologue(2));
-    assert!(noise_ik::prologue(7).starts_with(b"NEWNET1"));
+    assert!(noise_ik::prologue(7).starts_with(b"NEWNET2"));
     assert_eq!(noise_ik::prologue(7).len(), 7 + 8);
 }
 

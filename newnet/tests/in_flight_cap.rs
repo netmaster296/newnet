@@ -2,24 +2,29 @@
 // release the rest, and reordering inside the cap never trips the replay window.
 
 use newnet::crypto::PeerRecord;
-use newnet::link::Hub;
+use newnet::link::{Hub, ADDR_ANY};
 use newnet::node::Node;
 use newnet::session::MAX_IN_FLIGHT;
+
+mod common;
+use common::complete_cookie_round;
 
 fn pair() -> (Node, Node) {
     let mut a = Node::new("alice", 0xA11CE);
     let mut b = Node::new("bob", 0xB0B);
-    let rec_b = PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX };
-    let rec_a = PeerRecord { name: "alice".into(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX };
+    let rec_b = PeerRecord { name: "bob".into(), ed: Some(b.ident.ed_pub()), x: b.ident.x_pub, expiry: u64::MAX };
+    let rec_a = PeerRecord { name: "alice".into(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX };
     a.records.insert("bob".into(), rec_b);
     b.records.insert("alice".into(), rec_a);
     (a, b)
 }
 
-// Full three-datagram open through the nodes. Returns the conn id and the
-// first handshake datagram as an eavesdropper would have recorded it.
+// Full open through the nodes, cookie round included. Returns the conn id
+// and the handshake datagram as an eavesdropper would have recorded it:
+// the copy that carries the cookie.
 fn open(a: &mut Node, b: &mut Node, eph: u8) -> (u64, Vec<u8>) {
     let (conn, hs1) = a.connect("bob", Some([eph; 32])).unwrap();
+    let hs1 = complete_cookie_round(a, b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 1);
     assert_eq!(hs2.len(), 1, "responder answers: {:?}", b.stats);
     let confirm = a.on_datagram(&hs2[0], 1);
@@ -82,6 +87,7 @@ fn reordering_inside_the_cap_never_trips_the_replay_window() {
     let (mut a, mut b) = pair();
     let mut hub = Hub::new(2, 0, 5, 7);
     let (conn, hs1) = a.connect_at("bob", Some([4u8; 32]), 0).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     for o in b.on_datagram(&hs1, 0) {
         for c in a.on_datagram(&o, 0) {
             b.on_datagram(&c, 0);

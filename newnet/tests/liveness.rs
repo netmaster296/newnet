@@ -3,15 +3,19 @@
 // never confirms is dropped instead of kept alive by a dead initiator.
 
 use newnet::crypto::PeerRecord;
+use newnet::link::ADDR_ANY;
 use newnet::node::Node;
+
+mod common;
+use common::complete_cookie_round;
 use newnet::session::PING_RESENDS;
 use newnet::streams::Frame;
 
 fn pair() -> (Node, Node) {
     let mut a = Node::new("alice", 0xA11CE);
     let mut b = Node::new("bob", 0xB0B);
-    let rec_b = PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX };
-    let rec_a = PeerRecord { name: "alice".into(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX };
+    let rec_b = PeerRecord { name: "bob".into(), ed: Some(b.ident.ed_pub()), x: b.ident.x_pub, expiry: u64::MAX };
+    let rec_a = PeerRecord { name: "alice".into(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX };
     a.records.insert("bob".into(), rec_b);
     b.records.insert("alice".into(), rec_a);
     (a, b)
@@ -21,6 +25,7 @@ fn pair() -> (Node, Node) {
 fn the_responder_answers_the_ping_and_the_initiator_is_confirmed() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect_at("bob", None, 0).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 0);
     assert_eq!(hs2.len(), 1);
     let ping = a.on_datagram(&hs2[0], 0);
@@ -36,6 +41,7 @@ fn the_responder_answers_the_ping_and_the_initiator_is_confirmed() {
 fn a_reply_is_never_answered() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect_at("bob", None, 0).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 0);
     assert_eq!(hs2.len(), 1);
     let ping = a.on_datagram(&hs2[0], 0);
@@ -53,6 +59,7 @@ fn a_reply_is_never_answered() {
 fn a_lost_ping_is_resent_until_the_responder_confirms() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect_at("bob", None, 0).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 0);
     assert_eq!(hs2.len(), 1);
     a.on_datagram(&hs2[0], 0); // a's first PING is lost
@@ -78,6 +85,7 @@ fn a_lost_ping_is_resent_until_the_responder_confirms() {
 fn a_session_whose_peer_never_confirms_is_dropped() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect_at("bob", None, 0).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 0);
     assert_eq!(hs2.len(), 1);
     a.on_datagram(&hs2[0], 0); // everything from here on is lost
@@ -95,6 +103,7 @@ fn a_session_whose_peer_never_confirms_is_dropped() {
 fn data_from_the_peer_confirms_without_a_reply() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect_at("bob", None, 0).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 0);
     assert_eq!(hs2.len(), 1);
     let ping = a.on_datagram(&hs2[0], 0);

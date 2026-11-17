@@ -4,13 +4,17 @@
 
 use newnet::crypto::PeerRecord;
 use newnet::identity::IdentityError;
+use newnet::link::ADDR_ANY;
 use newnet::node::{ConnectError, Node};
+
+mod common;
+use common::complete_cookie_round;
 
 fn pair() -> (Node, Node) {
     let mut a = Node::new("alice", 0xA11CE);
     let mut b = Node::new("bob", 0xB0B);
-    let rec_b = PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX };
-    let rec_a = PeerRecord { name: "alice".into(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX };
+    let rec_b = PeerRecord { name: "bob".into(), ed: Some(b.ident.ed_pub()), x: b.ident.x_pub, expiry: u64::MAX };
+    let rec_a = PeerRecord { name: "alice".into(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX };
     a.records.insert("bob".into(), rec_b);
     b.records.insert("alice".into(), rec_a);
     (a, b)
@@ -32,6 +36,7 @@ fn expired_record_is_refused_by_the_responder() {
     let (mut a, mut b) = pair();
     b.records.get_mut("alice").unwrap().expiry = 5;
     let (_, hs1) = a.connect_at("bob", None, 0).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let out = b.on_datagram(&hs1, 10);
     assert!(out.is_empty());
     assert_eq!(b.half_open_count(), 0);
@@ -42,6 +47,7 @@ fn expired_record_is_refused_by_the_responder() {
 fn responder_pins_on_first_handshake_and_refuses_a_changed_key() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect("bob", Some([1u8; 32])).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 1);
     assert_eq!(hs2.len(), 1);
     let confirm = a.on_datagram(&hs2[0], 1);
@@ -55,14 +61,15 @@ fn responder_pins_on_first_handshake_and_refuses_a_changed_key() {
     let mut a2 = Node::new("alice", 0xBAD);
     a2.records.insert(
         "bob".into(),
-        PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX },
+        PeerRecord { name: "bob".into(), ed: Some(b.ident.ed_pub()), x: b.ident.x_pub, expiry: u64::MAX },
     );
     b.records.insert(
         "alice".into(),
-        PeerRecord { name: "alice".into(), ed: a2.ident.ed_pub(), x: a2.ident.x_pub, expiry: u64::MAX },
+        PeerRecord { name: "alice".into(), ed: Some(a2.ident.ed_pub()), x: a2.ident.x_pub, expiry: u64::MAX },
     );
     let (_, hs1_2) = a2.connect("bob", None).unwrap();
     let before = b.stats.auth_fails;
+    let hs1_2 = complete_cookie_round(&mut a2, &mut b, hs1_2, ADDR_ANY);
     let out = b.on_datagram(&hs1_2, 2);
     assert!(out.is_empty());
     assert_eq!(b.half_open_count(), 0);
@@ -78,7 +85,7 @@ fn initiator_pins_the_responder_on_first_connect() {
     let bad = Node::new("bob", 0xBAD);
     a.records.insert(
         "bob".into(),
-        PeerRecord { name: "bob".into(), ed: bad.ident.ed_pub(), x: bad.ident.x_pub, expiry: u64::MAX },
+        PeerRecord { name: "bob".into(), ed: Some(bad.ident.ed_pub()), x: bad.ident.x_pub, expiry: u64::MAX },
     );
     assert_eq!(a.connect("bob", None), Err(ConnectError::Pin(IdentityError::PinMismatch)));
 }

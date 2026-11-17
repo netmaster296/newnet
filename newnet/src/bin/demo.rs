@@ -100,7 +100,7 @@ fn main() {
         nodes[i].pins.check_or_pin("registry.example", *anchor.ed_pub().as_bytes(), anchor.x_pub.as_bytes().to_owned(), u64::MAX, NOW).unwrap();
         nodes[i].records.insert(
             "registry.example".into(),
-            newnet::crypto::PeerRecord { name: "registry.example".into(), ed: anchor.ed_pub(), x: anchor.x_pub, expiry: u64::MAX },
+            newnet::crypto::PeerRecord { name: "registry.example".into(), ed: Some(anchor.ed_pub()), x: anchor.x_pub, expiry: u64::MAX },
         );
     }
 
@@ -310,6 +310,7 @@ fn main() {
     // Flood: 10k random + 1k well-formed garbage handshakes at Bob.
     let s0 = nodes[BOB].stats.sessions_allocated;
     let d0 = nodes[BOB].stats.dh_count;
+    let cs0 = nodes[BOB].stats.cookies_sent;
     let mut frng = Rng::new(0xF10D);
     for _ in 0..10_000 {
         let p = attacks::random_packet(&mut frng, 1200);
@@ -323,14 +324,32 @@ fn main() {
     let fr = pump(&mut hub, &mut nodes, 40);
     assert_eq!(nodes[BOB].stats.sessions_allocated, s0, "flood allocates no sessions");
     let dh_used = nodes[BOB].stats.dh_count - d0;
+    let cookies_sent = nodes[BOB].stats.cookies_sent - cs0;
     assert!(dh_used <= 4 * (fr as u64) * crypto::HANDSHAKE_DH_BUDGET_PER_TICK as u64);
-    println!("[12] flood: 10k random + 1k garbage handshakes -> 0 sessions, DH work capped by per-tick budget ({dh_used} DH in {fr} ticks)");
+    println!("[12] flood: 10k random + 1k garbage handshakes -> 0 sessions, {cookies_sent} cookie answers (no DH, no budget charged), DH work capped by per-tick budget ({dh_used} DH in {fr} ticks)");
 
     // MITM part 1: a forged HS2 neither completes nor ends Alice's handshake.
-    hub.step();
+    // The flood just spent this budget epoch's handshake budget, so move the
+    // hub a full epoch forward before the real handshake: budgets reset when
+    // tick / BUDGET_EPOCH_TICKS changes.
+    for _ in 0..=node::BUDGET_EPOCH_TICKS {
+        hub.step();
+    }
     let (conn, hs1) = nodes[ALICE].connect("bob.example", None).unwrap();
-    let hs2 = nodes[BOB].on_datagram(&hs1, hub.tick);
-    assert_eq!(hs2.len(), 1, "bob answers the untouched hs1 with exactly one hs2");
+    // Hand-driven handshake at the wall: the cookie round first. The
+    // untouched hs1 (zero cookie) is answered with a 40-byte COOKIE; the
+    // rebuilt copy carrying it is answered with the hs2.
+    let ck = nodes[BOB].on_datagram(&hs1, hub.tick);
+    assert_eq!(ck.len(), 1, "bob answers the untouched hs1 with exactly one cookie");
+    assert_eq!(
+        newnet::wire::decode(&ck[0]).expect("the cookie reply decodes").header.ptype,
+        newnet::wire::TYPE_COOKIE,
+        "the first answer to the untouched hs1 is the COOKIE"
+    );
+    let hs1b = nodes[ALICE].on_datagram(&ck[0], hub.tick);
+    assert_eq!(hs1b.len(), 1, "alice rebuilds the hs1 with the cookie");
+    let hs2 = nodes[BOB].on_datagram(&hs1b[0], hub.tick);
+    assert_eq!(hs2.len(), 1, "bob answers the cookie-bearing hs1 with exactly one hs2");
     let forged = newnet::wire::encode(
         &newnet::wire::Header { version: newnet::wire::VERSION, ptype: newnet::wire::TYPE_HANDSHAKE2, conn_id: conn, seq: 0, len: 48 },
         &[0x4Du8; 48],
@@ -356,7 +375,12 @@ fn main() {
     hub.step();
     let bf = nodes[BOB].stats.auth_fails;
     let bh = nodes[BOB].half_open_count();
-    let out = nodes[BOB].on_datagram(&pkt, hub.tick);
+    // Cookie round first, so the stranger reaches the key check.
+    let ck = nodes[BOB].on_datagram(&pkt, hub.tick);
+    assert_eq!(ck.len(), 1, "the stranger's zero-cookie hs1 gets exactly one cookie");
+    let pkt = fake.on_datagram(&ck[0], hub.tick);
+    assert_eq!(pkt.len(), 1, "the stranger rebuilds the hs1 with the cookie");
+    let out = nodes[BOB].on_datagram(&pkt[0], hub.tick);
     assert!(out.is_empty(), "bob answers the stranger with nothing");
     assert_eq!(nodes[BOB].stats.auth_fails, bf + 1, "stranger costs exactly one auth fail");
     assert_eq!(nodes[BOB].half_open_count(), bh, "stranger allocates no half-open state");

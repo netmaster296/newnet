@@ -11,9 +11,16 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::link::{Addr, ADDR_ANY};
 use crate::node::{ConnectError, Node};
 
-pub const TICK_MS: u64 = 20;
-pub const TIMEOUT_TICKS: u64 = 25;
-// Datagrams one poll may send per tick.
+pub const TICK_MS: u64 = 1;
+pub const TIMEOUT_TICKS: u64 = 500;
+// Send pacing epochs (BURST per epoch) and the handshake budget: one epoch
+// is 20 ticks, so both keep the v1 per-20 ms rate with 1 ms ticks.
+pub const PACING_EPOCH_TICKS: u64 = 20;
+// Minimum ticks between gap retransmits of one chunk on a real endpoint
+// (amendment A6a): 20 ticks = 20 ms, the v1 rate. Without it a missing
+// chunk is re-sent once per millisecond and floods a slow receiver.
+pub const GAP_INTERVAL_TICKS: u64 = 20;
+// Datagrams one pacing epoch (20 ticks) may send.
 pub const BURST: usize = 32;
 pub const MAX_PEERS: usize = 4096;
 // A flood must not starve the timers or the send step: one poll drains at
@@ -33,8 +40,8 @@ pub struct UdpEndpoint {
     max_peers: usize,
     evict_next: usize,
     out: VecDeque<(SocketAddr, Vec<u8>)>,
-    send_tick: u64,
-    sent_this_tick: usize,
+    send_epoch: u64,
+    sent_this_epoch: usize,
     max_out: usize,
     // Datagrams the OS refused at send time (dropped, poll goes on).
     pub send_errors: u64,
@@ -52,6 +59,8 @@ impl UdpEndpoint {
         socket.set_nonblocking(true)?;
         let epoch_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         node.set_stamp_base(epoch_ms);
+        node.set_stamp_floor(epoch_ms.saturating_sub(300_000));
+        node.set_gap_interval(GAP_INTERVAL_TICKS);
         Ok(UdpEndpoint {
             node,
             socket,
@@ -61,8 +70,8 @@ impl UdpEndpoint {
             max_peers,
             evict_next: 0,
             out: VecDeque::new(),
-            send_tick: 0,
-            sent_this_tick: 0,
+            send_epoch: 0,
+            sent_this_epoch: 0,
             max_out: MAX_OUT,
             send_errors: 0,
             dropped_out: 0,
@@ -157,7 +166,7 @@ impl UdpEndpoint {
                     received += 1;
                     let now = self.now();
                     let id = self.addr_id(src);
-                    let outs = self.node.on_datagram_from(id, &buf[..n], now);
+                    let outs = self.node.on_datagram_src(id, &crate::cookie::src_key_from_socket(&src), &buf[..n], now);
                     for dgram in outs {
                         self.queue_to(id, dgram);
                     }
@@ -179,16 +188,17 @@ impl UdpEndpoint {
         }
 
         // Sends are paced by time, not by how often poll is called: at most
-        // BURST datagrams go out per tick, however many polls fall inside it.
-        let now = self.now();
-        if now != self.send_tick {
-            self.send_tick = now;
-            self.sent_this_tick = 0;
+        // BURST datagrams go out per 20-tick pacing epoch (20 ms), however
+        // many polls fall inside it.
+        let epoch = self.now() / PACING_EPOCH_TICKS;
+        if epoch != self.send_epoch {
+            self.send_epoch = epoch;
+            self.sent_this_epoch = 0;
         }
-        while self.sent_this_tick < BURST {
+        while self.sent_this_epoch < BURST {
             let Some((sa, dgram)) = self.out.pop_front() else { break };
             match self.socket.send_to(&dgram, sa) {
-                Ok(_) => self.sent_this_tick += 1,
+                Ok(_) => self.sent_this_epoch += 1,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     self.out.push_front((sa, dgram));
                     break;

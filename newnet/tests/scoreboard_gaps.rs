@@ -9,7 +9,8 @@
 // not its own.
 
 use newnet::crypto::{PeerRecord, SplitKeys};
-use newnet::node::{Node, MAX_HALF_OPEN};
+use newnet::link::ADDR_ANY;
+use newnet::node::{Node, BUDGET_EPOCH_TICKS, HALF_OPEN_TTL, MAX_HALF_OPEN};
 use newnet::noise_ik::{self, Hello};
 use newnet::session::Session;
 use newnet::streams::{self, Frame};
@@ -109,17 +110,22 @@ mod mini {
 fn pair() -> (Node, Node) {
     let mut a = Node::new("alice", 0xA11CE);
     let mut b = Node::new("bob", 0xB0B);
-    let rec_b = PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX };
-    let rec_a = PeerRecord { name: "alice".into(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX };
+    let rec_b = PeerRecord { name: "bob".into(), ed: Some(b.ident.ed_pub()), x: b.ident.x_pub, expiry: u64::MAX };
+    let rec_a = PeerRecord { name: "alice".into(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX };
     a.records.insert("bob".into(), rec_b);
     b.records.insert("alice".into(), rec_a);
     (a, b)
 }
 
-// Full three-datagram open through the nodes. Returns the conn id and the
-// first handshake datagram as an eavesdropper would have recorded it.
+mod common;
+use common::{complete_cookie_round, cookie_for_handbuilt, fill_cookie};
+
+// Full open through the nodes, cookie round included. Returns the conn id
+// and the handshake datagram as an eavesdropper would have recorded it:
+// the copy that carries the cookie.
 fn open(a: &mut Node, b: &mut Node, eph: u8) -> (u64, Vec<u8>) {
     let (conn, hs1) = a.connect("bob", Some([eph; 32])).unwrap();
+    let hs1 = complete_cookie_round(a, b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 1);
     assert_eq!(hs2.len(), 1, "responder answers: {:?}", b.stats);
     let confirm = a.on_datagram(&hs2[0], 1);
@@ -145,6 +151,13 @@ fn hello(stamp: u64) -> Vec<u8> {
 
 fn hs_packet(ptype: u8, conn: u64, body: &[u8]) -> Vec<u8> {
     wire::encode(&wire::Header { version: wire::VERSION, ptype, conn_id: conn, seq: 0, len: body.len() as u16 }, body)
+}
+
+// v2 HANDSHAKE1: 16 zero cookie bytes in front of the Noise message.
+fn hs1_zero_cookie(conn: u64, noise: &[u8]) -> Vec<u8> {
+    let mut body = vec![0u8; wire::COOKIE_LEN];
+    body.extend_from_slice(noise);
+    hs_packet(wire::TYPE_HANDSHAKE1, conn, &body)
 }
 
 fn initiator_session(conn: u64, k1: [u8; 32], k2: [u8; 32]) -> Session {
@@ -173,6 +186,7 @@ fn cleartext_close_must_not_kill_a_live_session() {
 fn responder_is_not_open_until_the_initiator_proves_its_keys() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect("bob", Some([2u8; 32])).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 1);
     assert_eq!(hs2.len(), 1);
     assert!(!b.is_open(conn), "message 1 alone is replayable; it must not open a session");
@@ -192,7 +206,14 @@ fn recorded_hs1_under_fresh_conn_id_must_not_allocate() {
     let (_conn, hs1) = open(&mut a, &mut b, 3);
     let mut p = wire::decode(&hs1).unwrap();
     p.header.conn_id ^= 0xDEAD_BEEF;
-    let out = b.on_datagram(&wire::encode(&p.header, &p.body), 2);
+    let tampered = wire::encode(&p.header, &p.body);
+    // The recorded cookie belongs to the old conn: a fresh conn gets a fresh
+    // cookie challenge, and the same recorded Noise still must not allocate.
+    let ck = b.on_datagram(&tampered, 2);
+    assert_eq!(ck.len(), 1, "the fresh conn is answered with one COOKIE");
+    assert_eq!(wire::decode(&ck[0]).unwrap().header.ptype, wire::TYPE_COOKIE, "the challenge is a COOKIE");
+    let filled = fill_cookie(&tampered, &wire::decode(&ck[0]).unwrap().body);
+    let out = b.on_datagram(&filled, 2);
     assert!(out.is_empty(), "Bob answered a recorded HS1 under a new conn id");
     assert_eq!(b.half_open_count(), 0);
     assert_eq!(b.stats.sessions_allocated, 1);
@@ -205,7 +226,7 @@ fn recorded_hs1_replayed_after_the_session_is_gone_must_not_allocate() {
     let c = a.close(conn).unwrap();
     b.on_datagram(&c, 2);
     assert!(b.sessions.is_empty());
-    let out = b.on_datagram(&hs1, 3); // same bytes, same conn id, later
+    let out = b.on_datagram(&hs1, 3); // same bytes, same conn id, later: cookie still fresh
     assert!(out.is_empty(), "Bob answered a stale HS1");
     assert_eq!(b.half_open_count(), 0);
     assert_eq!(b.stats.hs_replay_dropped, 1);
@@ -217,10 +238,11 @@ fn recorded_hs1_replayed_after_the_session_is_gone_must_not_allocate() {
 fn half_open_is_reaped_even_after_junk_data() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect("bob", Some([6u8; 32])).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     assert_eq!(b.on_datagram(&hs1, 1).len(), 1); // reply never reaches Alice
     b.on_datagram(&newnet::attacks::spoof_data(conn, 0, &[1u8; 32], b"junk"), 1);
     assert_eq!(b.half_open_count(), 1, "junk data neither opens nor removes it");
-    for t in 2..=60 {
+    for t in 2..=(HALF_OPEN_TTL + 60) {
         b.tick_sessions(t, 3);
     }
     assert_eq!(b.half_open_count(), 0, "unconfirmed handshake still held 59 ticks later");
@@ -231,8 +253,14 @@ fn half_open_is_reaped_even_after_junk_data() {
 fn half_open_table_is_bounded() {
     let (mut a, mut b) = pair();
     for i in 0..(MAX_HALF_OPEN as u64 + 6) {
+        // One name holds at most MAX_HALF_OPEN_PER_PEER half-open entries
+        // (step 5), so filling the global table takes one name per conn.
+        let name = format!("peer{i}");
+        a.name = name.clone();
+        b.records.insert(name.clone(), PeerRecord { name: name.clone(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX });
         let (_c, hs1) = a.connect("bob", None).unwrap();
-        b.on_datagram(&hs1, 100 + i); // a new tick each time, so the DH budget is not the limit
+        let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
+        b.on_datagram(&hs1, 100 + i * BUDGET_EPOCH_TICKS); // a new budget epoch each time, so the DH budget is not the limit
     }
     assert_eq!(b.half_open_count(), MAX_HALF_OPEN);
     assert_eq!(b.stats.half_open_dropped_full, 6);
@@ -243,6 +271,7 @@ fn half_open_table_is_bounded() {
 fn lost_hs2_is_healed_by_resending_the_same_datagram() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect_at("bob", Some([7u8; 32]), 0).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     assert_eq!(b.on_datagram(&hs1, 0).len(), 1); // Bob's reply is lost
     let dh_before = b.stats.dh_count;
     for t in 1..=10 {
@@ -288,6 +317,7 @@ fn a_forged_far_future_sequence_number_derives_no_keys() {
     // Same forged packet against a handshake that is only half open.
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect("bob", Some([11u8; 32])).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 1);
     b.on_datagram(&newnet::attacks::spoof_data(conn, 3_000_000_000, &[1u8; 32], b"x"), 1);
     b.on_datagram(&newnet::attacks::spoof_data(conn, u64::MAX, &[1u8; 32], b"x"), 1);
@@ -302,6 +332,7 @@ fn a_forged_far_future_sequence_number_derives_no_keys() {
 fn a_forged_hs2_does_not_kill_a_pending_handshake() {
     let (mut a, mut b) = pair();
     let (conn, hs1) = a.connect("bob", Some([8u8; 32])).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 1);
     assert!(a.on_datagram(&hs_packet(wire::TYPE_HANDSHAKE2, conn, &[0x55u8; 48]), 1).is_empty());
     assert_eq!(a.stats.auth_fails, 1);
@@ -339,7 +370,8 @@ fn an_independent_noise_ik_initiator_interoperates() {
     let e = StaticSecret::from([0x21u8; 32]);
     let conn = 0x1111u64;
     let (m1, st) = mini::msg1(&noise_ik::prologue(conn), &sb_pub, &public(&e), &sa_pub, &dh(&e, &sb_pub), &dh(&sa, &sb_pub), &hello(1));
-    let out = b.on_datagram(&hs_packet(wire::TYPE_HANDSHAKE1, conn, &m1), 1);
+    let filled = cookie_for_handbuilt(&mut b, &hs1_zero_cookie(conn, &m1), ADDR_ANY, 1);
+    let out = b.on_datagram(&filled, 1);
     assert_eq!(out.len(), 1, "Bob answers a spec-built message 1: {:?}", b.stats);
     let m2 = wire::decode(&out[0]).unwrap().body;
     let re: [u8; 32] = m2[..32].try_into().unwrap();
@@ -362,7 +394,8 @@ fn bobs_static_key_alone_must_not_let_anyone_be_alice() {
     let e = StaticSecret::from([0x66u8; 32]);
     let conn = 0x4D41u64;
     let (m1, st) = mini::msg1(&noise_ik::prologue(conn), &sb_pub, &public(&e), &sa_pub, &dh(&e, &sb_pub), &dh(&sb, &sa_pub), &hello(1));
-    let out = b.on_datagram(&hs_packet(wire::TYPE_HANDSHAKE1, conn, &m1), 1);
+    let filled = cookie_for_handbuilt(&mut b, &hs1_zero_cookie(conn, &m1), ADDR_ANY, 1);
+    let out = b.on_datagram(&filled, 1);
     assert_eq!(out.len(), 1, "forged message 1 is expected to be answered: {:?}", b.stats);
     let m2 = wire::decode(&out[0]).unwrap().body;
     let re: [u8; 32] = m2[..32].try_into().unwrap();
@@ -392,7 +425,8 @@ fn both_static_keys_do_not_open_a_recorded_session() {
 
     // The honest session, recorded.
     let (m1, st) = mini::msg1(&prologue, &sb_pub, &e_pub, &sa_pub, &dh(&e, &sb_pub), &dh(&sa, &sb_pub), &hello(1));
-    let out = b.on_datagram(&hs_packet(wire::TYPE_HANDSHAKE1, conn, &m1), 1);
+    let filled = cookie_for_handbuilt(&mut b, &hs1_zero_cookie(conn, &m1), ADDR_ANY, 1);
+    let out = b.on_datagram(&filled, 1);
     let m2 = wire::decode(&out[0]).unwrap().body;
     let re: [u8; 32] = m2[..32].try_into().unwrap();
     let (ok, k1, k2) = mini::finish(st, &m2, &dh(&e, &re), &dh(&sa, &re));

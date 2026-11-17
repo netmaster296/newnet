@@ -51,11 +51,16 @@ pub fn random_packet(rng: &mut Rng, max_len: usize) -> Vec<u8> {
     rng.bytes(n)
 }
 
-// Well-formed NEW1 handshake1-shaped packet with random body: full header
-// parse, garbage payload.
+// Well-formed NEW1 handshake1-shaped packet with random Noise bytes behind
+// the 16 zero cookie bytes of a first try: full header parse, garbage
+// payload. Noise length keeps the whole datagram inside the legal
+// 147..=210 HANDSHAKE1 range (v2 spec 2.2), so it costs what a real first
+// try costs.
 pub fn garbage_handshake(rng: &mut Rng, conn: u64) -> Vec<u8> {
-    let n = 64 + (rng.next() % 200) as usize;
-    let body = rng.bytes(n);
+    let n = 107 + (rng.next() % 64) as usize;
+    let noise = rng.bytes(n);
+    let mut body = vec![0u8; wire::COOKIE_LEN];
+    body.extend_from_slice(&noise);
     wire::encode(
         &wire::Header {
             version: wire::VERSION,
