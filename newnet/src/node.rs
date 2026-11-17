@@ -12,7 +12,7 @@ use crate::identity::{Identity, PinStore};
 use crate::link::{Addr, ADDR_ANY};
 use crate::naming::{NameRecord, Registry};
 use crate::noise_ik::{self, Hello, InitiatorHandshake, ResponderHandshake};
-use crate::session::{Session, SessionError};
+use crate::session::{Session, SessionError, IDLE_TTL};
 use crate::streams::Frame;
 use crate::wire;
 
@@ -50,6 +50,7 @@ pub struct NodeStats {
     pub hs_replay_dropped: u64,
     pub half_open_dropped_full: u64,
     pub sessions_dead: u64,
+    pub sessions_idle_dropped: u64,
 }
 
 struct PendingInit {
@@ -346,6 +347,7 @@ impl Node {
         // Follow the packet; fall back to the recorded destination when the
         // reply arrived with an unknown source.
         s.peer_addr = if from == ADDR_ANY { removed.to } else { from };
+        s.note_heard(tick);
         let ping = s.seal_frame(&Frame { ftype: crate::streams::FRAME_PING, id: 0, off: 0, cum: 0, sacks: vec![], data: vec![] });
         s.note_ping_sent(tick);
         self.logs.push(format!("handshake open conn={conn} transcript={}", hex::encode(s.transcript)));
@@ -393,6 +395,7 @@ impl Node {
             self.half_open.remove(&conn);
             // The confirming packet names the peer.
             s.peer_addr = from;
+            s.note_heard(tick);
             self.sessions.insert(conn, s);
             self.stats.sessions_allocated += 1;
             // The replay window already recorded this packet: handle the
@@ -408,6 +411,7 @@ impl Node {
     fn handle_opened(&mut self, conn: u64, pt: Vec<u8>, tick: u64) -> Vec<Vec<u8>> {
         self.stats.data_ok += 1;
         let s = self.sessions.get_mut(&conn).unwrap();
+        s.note_heard(tick);
         let replies = match s.on_frame(&pt, tick) {
             Ok(v) => v,
             Err(_) => return vec![],
@@ -533,6 +537,19 @@ impl Node {
             .collect();
         for conn in reap {
             self.half_open.remove(&conn);
+        }
+        // Sessions whose peer has fallen silent past the idle TTL are gone.
+        // Nothing is sent to the silent peer.
+        let idle: Vec<u64> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.idle_expired(now))
+            .map(|(c, _)| *c)
+            .collect();
+        for conn in idle {
+            self.sessions.remove(&conn);
+            self.stats.sessions_idle_dropped += 1;
+            self.logs.push(format!("session idle conn={conn}: nothing heard for {IDLE_TTL} ticks"));
         }
         for (conn, s) in self.sessions.iter_mut() {
             let frames = s.tick_timeouts(now, timeout);
