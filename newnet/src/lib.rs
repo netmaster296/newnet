@@ -11,4 +11,5 @@ pub mod noise_ik;
 pub mod pcap;
 pub mod session;
 pub mod streams;
+pub mod udp;
 pub mod wire;

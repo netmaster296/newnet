@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use ed25519_dalek::VerifyingKey;
+use rand::RngCore;
 
 use crate::content::{self, Msg, Reader};
 use crate::crypto::{self, PeerRecord};
@@ -11,7 +12,7 @@ use crate::identity::{Identity, PinStore};
 use crate::link::{Addr, ADDR_ANY};
 use crate::naming::{NameRecord, Registry};
 use crate::noise_ik::{self, Hello, InitiatorHandshake, ResponderHandshake};
-use crate::session::{Session, SessionError};
+use crate::session::{Session, SessionError, IDLE_TTL};
 use crate::streams::Frame;
 use crate::wire;
 
@@ -49,6 +50,7 @@ pub struct NodeStats {
     pub hs_replay_dropped: u64,
     pub half_open_dropped_full: u64,
     pub sessions_dead: u64,
+    pub sessions_idle_dropped: u64,
 }
 
 struct PendingInit {
@@ -83,7 +85,6 @@ pub struct Node {
     pub stats: NodeStats,
     pub logs: Vec<String>,
     pub registry: Option<Registry>,
-    next_conn: u64,
     budget_tick: u64,
     budget_by_source: HashMap<Addr, u32>,
     budget_total: u32,
@@ -105,7 +106,6 @@ impl Node {
             stats: NodeStats::default(),
             logs: Vec::new(),
             registry: None,
-            next_conn: seed ^ 0xC0FFEE,
             budget_tick: u64::MAX,
             budget_by_source: HashMap::new(),
             budget_total: 0,
@@ -160,12 +160,30 @@ impl Node {
         self.start_attempt(name, eph, tick, 1, to)
     }
 
+    // A real endpoint calls this once at start with wall-clock milliseconds,
+    // so stamps keep increasing across restarts. The in-memory lab does not
+    // need it. The stamp never moves backwards.
+    pub fn set_stamp_base(&mut self, base: u64) {
+        if base > self.next_stamp {
+            self.next_stamp = base;
+        }
+    }
+
+    pub fn next_stamp(&self) -> u64 {
+        self.next_stamp
+    }
+
     // One handshake attempt: fresh IK machine bound to conn via prologue,
     // Hello(stamp, name) as the msg1 payload, stored for identical resends.
     fn start_attempt(&mut self, name: &str, eph: Option<[u8; 32]>, tick: u64, attempt: u32, to: Addr) -> Result<(u64, Vec<u8>), ConnectError> {
         let rec = self.resolve(name, tick)?;
-        let conn = self.next_conn;
-        self.next_conn = self.next_conn.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut rng = rand::rngs::OsRng;
+        let conn = loop {
+            let c = rng.next_u64();
+            if !self.sessions.contains_key(&c) && !self.pending_init.contains_key(&c) && !self.half_open.contains_key(&c) {
+                break c;
+            }
+        };
         self.next_stamp += 1;
         let stamp = self.next_stamp;
         let mut hs = InitiatorHandshake::new(&self.ident.x_static.to_bytes(), rec.x.as_bytes(), &noise_ik::prologue(conn), eph)
@@ -329,6 +347,7 @@ impl Node {
         // Follow the packet; fall back to the recorded destination when the
         // reply arrived with an unknown source.
         s.peer_addr = if from == ADDR_ANY { removed.to } else { from };
+        s.note_heard(tick);
         let ping = s.seal_frame(&Frame { ftype: crate::streams::FRAME_PING, id: 0, off: 0, cum: 0, sacks: vec![], data: vec![] });
         s.note_ping_sent(tick);
         self.logs.push(format!("handshake open conn={conn} transcript={}", hex::encode(s.transcript)));
@@ -376,6 +395,7 @@ impl Node {
             self.half_open.remove(&conn);
             // The confirming packet names the peer.
             s.peer_addr = from;
+            s.note_heard(tick);
             self.sessions.insert(conn, s);
             self.stats.sessions_allocated += 1;
             // The replay window already recorded this packet: handle the
@@ -391,6 +411,7 @@ impl Node {
     fn handle_opened(&mut self, conn: u64, pt: Vec<u8>, tick: u64) -> Vec<Vec<u8>> {
         self.stats.data_ok += 1;
         let s = self.sessions.get_mut(&conn).unwrap();
+        s.note_heard(tick);
         let replies = match s.on_frame(&pt, tick) {
             Ok(v) => v,
             Err(_) => return vec![],
@@ -516,6 +537,19 @@ impl Node {
             .collect();
         for conn in reap {
             self.half_open.remove(&conn);
+        }
+        // Sessions whose peer has fallen silent past the idle TTL are gone.
+        // Nothing is sent to the silent peer.
+        let idle: Vec<u64> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.idle_expired(now))
+            .map(|(c, _)| *c)
+            .collect();
+        for conn in idle {
+            self.sessions.remove(&conn);
+            self.stats.sessions_idle_dropped += 1;
+            self.logs.push(format!("session idle conn={conn}: nothing heard for {IDLE_TTL} ticks"));
         }
         for (conn, s) in self.sessions.iter_mut() {
             let frames = s.tick_timeouts(now, timeout);

@@ -17,6 +17,13 @@ pub const MAX_LOOKAHEAD: u64 = 1 << 20;
 // session is dropped as dead.
 pub const PING_RESENDS: u32 = 5;
 
+// Ticks without an authenticated packet from the peer before the session
+// is dropped.
+pub const IDLE_TTL: u64 = 600;
+
+// Ticks of silence before this side asks the peer to speak.
+pub const KEEPALIVE_AFTER: u64 = IDLE_TTL / 3;
+
 // A quarter of REPLAY_WINDOW, so that new chunks, gap retransmits and timer
 // retransmits sealed in one pump round (at most 3 x 512) stay inside the window.
 pub const MAX_IN_FLIGHT: usize = 512;
@@ -152,6 +159,10 @@ pub struct Session {
     pub confirmed: bool,
     ping_sent: u64,
     pings: u32,
+    // Tick the last authenticated packet from the peer was accepted.
+    last_heard: u64,
+    // Tick the last idle keepalive PING went out.
+    last_keepalive: u64,
     // Chunks waiting for their first transmission, in the order the
     // application submitted them: (stream id, offset, chunk bytes).
     send_queue: std::collections::VecDeque<(u32, u64, Vec<u8>)>,
@@ -188,6 +199,8 @@ impl Session {
             confirmed: false,
             ping_sent: 0,
             pings: 0,
+            last_heard: 0,
+            last_keepalive: 0,
             send_queue: std::collections::VecDeque::new(),
             in_flight_total: 0,
             rx_buffered: 0,
@@ -401,6 +414,19 @@ impl Session {
         self.ping_sent = now;
     }
 
+    // Record that an authenticated packet from the peer was accepted now.
+    pub fn note_heard(&mut self, now: u64) {
+        self.last_heard = now;
+    }
+
+    pub fn last_heard(&self) -> u64 {
+        self.last_heard
+    }
+
+    pub fn idle_expired(&self, now: u64) -> bool {
+        now >= self.last_heard + IDLE_TTL
+    }
+
     pub fn tick_timeouts(&mut self, now: u64, timeout: u64) -> Vec<Frame> {
         // Initiator liveness: keep proving the peer got the handshake until
         // it answers something. After PING_RESENDS silent probes the session
@@ -422,6 +448,23 @@ impl Session {
                 self.state = State::Closed;
                 return vec![];
             }
+        }
+        // Idle keepalive: a confirmed session that has heard nothing for
+        // KEEPALIVE_AFTER ticks asks the peer to speak. The peer answers a
+        // PING id 0 with id 1; hearing that answer refreshes last_heard.
+        if self.confirmed
+            && now >= self.last_heard + KEEPALIVE_AFTER
+            && now >= self.last_keepalive + KEEPALIVE_AFTER
+        {
+            self.last_keepalive = now;
+            out.push(Frame {
+                ftype: streams::FRAME_PING,
+                id: 0,
+                off: 0,
+                cum: 0,
+                sacks: vec![],
+                data: vec![],
+            });
         }
         let ids: Vec<u32> = self.tx_streams.keys().copied().collect();
         for id in ids {
