@@ -330,7 +330,7 @@ fn main() {
             hub.send(0, &o2);
             any = true;
         }
-        rounds += 1; if rounds == 1 || rounds == 5 || rounds == 13 || rounds == 14 { eprintln!("probe round={} any={} ok_bob={} fwd={} in_flight={}", rounds, any, nodes[1].stats.data_ok, hub.forwarded, nodes[0].sessions.get(&conn).map(|s| s.tx_streams.values().map(|t| t.pending()).sum::<usize>()).unwrap_or(0)); }
+        rounds += 1;
         if rounds % 2000 == 0 { eprintln!("round={} any={} ok={} fwd={} pend={}", rounds, any, nodes[1].stats.data_ok, hub.forwarded, nodes[0].sessions.get(&conn).map(|s| s.tx_streams.values().map(|t| t.pending()).sum::<usize>()).unwrap_or(0)); }
         if !any {
             let deliv = nodes[1]

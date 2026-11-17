@@ -200,13 +200,16 @@ impl StreamTx {
     }
 
     // Retransmit on gap: peer reported bytes past a hole we still hold.
+    // A chunk is re-sent at most once per tick; otherwise ACKs of our own
+    // retransmits re-fire the same hole and the traffic explodes.
     pub fn gap_retransmit(&mut self, id: u32, now: u64) -> Vec<Frame> {
         let holes: Vec<(u64, Vec<u8>)> = self
             .in_flight
             .iter()
-            .filter(|(off, (bytes, _))| {
+            .filter(|(off, (bytes, sent))| {
                 let end = **off + bytes.len() as u64 - 1;
-                !self.covered(**off, end)
+                *sent != now
+                    && !self.covered(**off, end)
                     && (self.sacks.iter().any(|(a, _)| *a > end) || self.acked > end + 1)
             })
             .map(|(off, (bytes, _))| (*off, bytes.clone()))
@@ -260,9 +263,11 @@ mod tests {
         assert_eq!(frames.len(), 3);
         // receiver got 0 and 2, gap at 1: cum=1100, sack (2200,3299)
         tx.on_ack(1100, &[(2200, 3299)]);
-        let holes = tx.gap_retransmit(1, 0);
+        let holes = tx.gap_retransmit(1, 5);
         assert_eq!(holes.len(), 1);
         assert_eq!(holes[0].off, 1100);
+        // same tick: an ACK of our own retransmit must not re-fire the hole
+        assert!(tx.gap_retransmit(1, 5).is_empty());
         // ack covers everything
         tx.on_ack(3300, &[]);
         assert_eq!(tx.pending(), 0);
@@ -316,5 +321,23 @@ mod tail_tests {
         // timer must still be able to fire for everything unacked
         let t2 = tx.timeout(1, 30, 3);
         assert_eq!(t2.len(), 1); // chunk 1 was sack-covered and dropped; chunk 0 keeps retrying
+    }
+
+    #[test]
+    fn gap_retransmit_fires_at_most_once_per_tick() {
+        let mut tx = StreamTx::new();
+        tx.send(1, &[5u8; 100], 0);
+        tx.send(1, &[6u8; 60], 0);
+        tx.on_ack(0, &[(100, 159)]);
+        // ACK storm: every ACK of the retransmit lands in the same tick
+        let g1 = tx.gap_retransmit(1, 11);
+        assert_eq!(g1.len(), 1);
+        for _ in 0..100 {
+            assert!(tx.gap_retransmit(1, 11).is_empty());
+        }
+        // next tick may retry once
+        let g2 = tx.gap_retransmit(1, 12);
+        assert_eq!(g2.len(), 1);
+        assert!(tx.gap_retransmit(1, 12).is_empty());
     }
 }
