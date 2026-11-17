@@ -13,10 +13,17 @@ use newnet::identity::Identity;
 use newnet::node::Node;
 use newnet::udp::UdpEndpoint;
 
+const MAX_FILE_BYTES: u64 = 1 << 30;
+
 fn usage() -> ! {
     eprintln!("usage: udpfile recv --name <name> --seed <n> --peer <name> --peer-seed <n> --listen <addr:port> --out <file> [--timeout-secs <n>]");
     eprintln!("   or: udpfile send --name <name> --seed <n> --peer <name> --peer-seed <n> --to <addr:port> --file <file> [--listen <addr:port>] [--timeout-secs <n>]");
     exit(2);
+}
+
+fn fail(msg: impl AsRef<str>) -> ! {
+    eprintln!("{}", msg.as_ref());
+    exit(1);
 }
 
 struct Opts {
@@ -113,10 +120,21 @@ fn timed_out(start: Instant, secs: u64) -> bool {
     start.elapsed() >= Duration::from_secs(secs)
 }
 
-// 16 chunks per slice: one poll's BURST is 32 datagrams, and bursts above
-// the peer's kernel receive buffer (64 KB on Windows) get dropped and turn
-// into a retransmit storm.
-const BURST_SLICE: usize = 16 * newnet::streams::CHUNK;
+// The announced length in the first 8 bytes, or None while fewer than 8
+// bytes have arrived. A length above `max` is an error, so no addition on
+// untrusted values can overflow: callers compare buf.len() - 8 >= n after
+// checking buf.len() >= 8.
+fn frame_length(buf: &[u8], max: u64) -> Result<Option<usize>, String> {
+    if buf.len() < 8 {
+        return Ok(None);
+    }
+    let b = [buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]];
+    let n = u64::from_le_bytes(b);
+    if n > max {
+        return Err(format!("length prefix {n} exceeds the limit of {max} bytes"));
+    }
+    Ok(Some(n as usize))
+}
 
 fn main() {
     let o = parse();
@@ -133,60 +151,62 @@ fn main() {
         let data = match &o.file {
             Some(f) => match std::fs::read(f) {
                 Ok(d) => d,
-                Err(_) => usage(),
+                Err(e) => fail(format!("cannot read the input file {}: {e}", f.display())),
             },
             None => usage(),
         };
         let mut ep = match UdpEndpoint::bind(node_with_peer(&o), &listen.to_string()) {
             Ok(e) => e,
-            Err(_) => usage(),
+            Err(e) => fail(format!("cannot bind {listen}: {e}")),
         };
-        let to = o.to.unwrap();
+        let to = match o.to {
+            Some(t) => t,
+            None => usage(),
+        };
         let conn = match ep.connect(&o.peer, to) {
             Ok(c) => c,
-            Err(_) => usage(),
+            Err(e) => fail(format!("cannot connect to {}: {e:?}", o.peer)),
         };
         let start = Instant::now();
         while !ep.node.is_open(conn) {
             if timed_out(start, o.timeout_secs) {
-                eprintln!("timed out");
-                exit(1);
+                fail("timed out");
             }
-            let r = ep.poll().unwrap();
-            if r == 0 && ep.queued() == 0 {
-                std::thread::sleep(Duration::from_millis(1));
+            match ep.poll() {
+                Ok(r) => {
+                    if r == 0 && ep.queued() == 0 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Err(e) => fail(format!("poll failed: {e}")),
             }
         }
         ep.send_bytes(conn, 1, &(data.len() as u64).to_le_bytes());
-        // Feed the file a slice per poll round: queuing all 1.5 MB at once
-        // lets the first BURST outrun the peer's small kernel receive buffer,
-        // and the retransmit storm that follows eats the transfer.
-        let mut pos = 0usize;
+        ep.send_bytes(conn, 1, &data);
         loop {
             let s = ep.node.sessions.get(&conn);
-            let done = pos >= data.len()
-                && ep.queued() == 0
+            let done = ep.queued() == 0
                 && matches!(s, Some(s) if s.in_flight_total() == 0 && s.queued_chunks() == 0);
             if done {
                 break;
             }
             if timed_out(start, o.timeout_secs) {
-                eprintln!("timed out");
-                exit(1);
+                fail("timed out");
             }
-            if ep.queued() == 0 && pos < data.len() {
-                let end = (pos + BURST_SLICE).min(data.len());
-                ep.send_bytes(conn, 1, &data[pos..end]);
-                pos = end;
-            }
-            let r = ep.poll().unwrap();
-            if r == 0 && ep.queued() == 0 {
-                std::thread::sleep(Duration::from_millis(1));
+            match ep.poll() {
+                Ok(r) => {
+                    if r == 0 && ep.queued() == 0 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Err(e) => fail(format!("poll failed: {e}")),
             }
         }
         ep.close(conn);
         for _ in 0..5 {
-            ep.poll().unwrap();
+            if let Err(e) = ep.poll() {
+                fail(format!("poll failed: {e}"));
+            }
             if ep.queued() == 0 {
                 break;
             }
@@ -195,44 +215,110 @@ fn main() {
         exit(0);
     }
 
-    let out = o.out.clone().unwrap();
+    let out = match &o.out {
+        Some(p) => p.clone(),
+        None => usage(),
+    };
     let mut ep = match UdpEndpoint::bind(node_with_peer(&o), &listen.to_string()) {
         Ok(e) => e,
-        Err(_) => usage(),
+        Err(e) => fail(format!("cannot bind {listen}: {e}")),
     };
     let start = Instant::now();
     let mut conn: Option<u64> = None;
     let mut buf: Vec<u8> = Vec::new();
     loop {
         if timed_out(start, o.timeout_secs) {
-            eprintln!("timed out");
-            exit(1);
+            fail("timed out");
         }
-        let r = ep.poll().unwrap();
+        match ep.poll() {
+            Ok(r) => {
+                if r == 0 && ep.queued() == 0 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Err(e) => fail(format!("poll failed: {e}")),
+        }
         if conn.is_none() {
-            conn = ep.node.sessions.keys().next().copied();
+            conn = ep
+                .node
+                .sessions
+                .keys()
+                .copied()
+                .find(|c| ep.node.peer_of(*c) == Some(o.peer.as_str()));
         }
         if let Some(c) = conn {
+            if ep.node.peer_of(c).is_none() {
+                fail("session ended before the file was complete");
+            }
             buf.extend(ep.node.take_stream_bytes(c, 1));
-            if buf.len() >= 8 {
-                let n = u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize;
-                if buf.len() >= 8 + n {
-                    match std::fs::write(&out, &buf[8..8 + n]) {
-                        Ok(_) => {}
-                        Err(_) => usage(),
+            match frame_length(&buf, MAX_FILE_BYTES) {
+                Ok(None) => {}
+                Err(msg) => fail(msg),
+                Ok(Some(n)) => {
+                    if buf.len() >= 8 && buf.len() - 8 >= n {
+                        if let Err(e) = std::fs::write(&out, &buf[8..8 + n]) {
+                            fail(format!("cannot write the output file {}: {e}", out.display()));
+                        }
+                        // Let the final ACKs leave before exiting: the sender
+                        // waits for them before it closes.
+                        loop {
+                            if ep.queued() == 0 {
+                                break;
+                            }
+                            if let Err(e) = ep.poll() {
+                                fail(format!("poll failed: {e}"));
+                            }
+                        }
+                        println!("received {n} bytes");
+                        exit(0);
                     }
-                    // Let the final ACKs leave before exiting: the sender
-                    // waits for them before it closes.
-                    while ep.queued() > 0 {
-                        ep.poll().unwrap();
-                    }
-                    println!("received {} bytes", n);
-                    exit(0);
                 }
             }
         }
-        if r == 0 && ep.queued() == 0 {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prefix(n: u64) -> Vec<u8> {
+        n.to_le_bytes().to_vec()
+    }
+
+    #[test]
+    fn seven_bytes_are_not_a_length_yet() {
+        let buf = vec![1u8; 7];
+        assert_eq!(frame_length(&buf, MAX_FILE_BYTES), Ok(None));
+    }
+
+    #[test]
+    fn a_small_prefix_is_returned_as_is() {
+        let buf = prefix(5);
+        assert_eq!(frame_length(&buf, MAX_FILE_BYTES), Ok(Some(5)));
+    }
+
+    #[test]
+    fn max_u64_prefix_is_an_error() {
+        let buf = prefix(u64::MAX);
+        assert!(frame_length(&buf, MAX_FILE_BYTES).is_err());
+    }
+
+    #[test]
+    fn near_max_u64_prefix_is_an_error() {
+        let buf = prefix(u64::MAX - 3);
+        assert!(frame_length(&buf, MAX_FILE_BYTES).is_err());
+    }
+
+    #[test]
+    fn a_prefix_of_exactly_max_is_accepted() {
+        let buf = prefix(MAX_FILE_BYTES);
+        assert_eq!(frame_length(&buf, MAX_FILE_BYTES), Ok(Some(MAX_FILE_BYTES as usize)));
+    }
+
+    #[test]
+    fn a_prefix_of_max_plus_one_is_an_error() {
+        let buf = prefix(MAX_FILE_BYTES + 1);
+        assert!(frame_length(&buf, MAX_FILE_BYTES).is_err());
     }
 }
