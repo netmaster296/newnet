@@ -107,7 +107,12 @@ impl StreamRx {
     }
 
     pub fn put(&mut self, off: u64, mut data: &[u8]) -> Vec<u8> {
-        if data.is_empty() || off + data.len() as u64 <= self.expected {
+        // The offset comes from the peer: an end at or past u64::MAX cannot
+        // be represented, so refuse the chunk and store nothing.
+        let Some(end) = off.checked_add(data.len() as u64) else {
+            return vec![];
+        };
+        if data.is_empty() || end <= self.expected {
             return vec![];
         }
         // A chunk starting below `expected` but ending above it would be
@@ -133,9 +138,9 @@ impl StreamRx {
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         for (off, bytes) in &self.buf {
             let start = *off;
-            let end = off + bytes.len() as u64 - 1;
+            let end = off.saturating_add(bytes.len() as u64).saturating_sub(1);
             if let Some(last) = ranges.last_mut() {
-                if start <= last.1 + 1 {
+                if start <= last.1.saturating_add(1) {
                     if end > last.1 {
                         last.1 = end;
                     }
@@ -372,5 +377,26 @@ mod tail_tests {
         let g2 = tx.gap_retransmit(1, 12);
         assert_eq!(g2.len(), 1);
         assert!(tx.gap_retransmit(1, 12).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::*;
+
+    #[test]
+    fn a_chunk_ending_past_u64_max_is_refused() {
+        let mut rx = StreamRx::default();
+        assert_eq!(rx.put(u64::MAX, &[1]), Vec::<u8>::new());
+        assert_eq!(rx.buffered(), 0);
+        assert_eq!(rx.put(u64::MAX - 1, &[1, 2, 3]), Vec::<u8>::new());
+        assert_eq!(rx.buffered(), 0);
+    }
+
+    #[test]
+    fn sacks_of_a_chunk_at_the_top_of_the_range_do_not_panic() {
+        let mut rx = StreamRx::default();
+        rx.put(u64::MAX - 10, &[1u8; 5]);
+        let _ = rx.sacks();
     }
 }

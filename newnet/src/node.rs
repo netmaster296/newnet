@@ -69,6 +69,7 @@ struct HalfOpen {
     keys: crypto::SplitKeys,
     created: u64,
     from: Addr,
+    peer: String,
 }
 
 pub struct Node {
@@ -322,7 +323,7 @@ impl Node {
             &wire::Header { version: wire::VERSION, ptype: wire::TYPE_HANDSHAKE2, conn_id: conn, seq: 0, len: msg2.len() as u16 },
             &msg2,
         );
-        self.half_open.insert(conn, HalfOpen { msg1: bytes.to_vec(), msg2: datagram2.clone(), keys, created: tick, from });
+        self.half_open.insert(conn, HalfOpen { msg1: bytes.to_vec(), msg2: datagram2.clone(), keys, created: tick, from, peer: hello.name.clone() });
         vec![datagram2]
     }
 
@@ -347,6 +348,7 @@ impl Node {
         // Follow the packet; fall back to the recorded destination when the
         // reply arrived with an unknown source.
         s.peer_addr = if from == ADDR_ANY { removed.to } else { from };
+        s.peer_name = removed.peer.clone();
         s.note_heard(tick);
         let ping = s.seal_frame(&Frame { ftype: crate::streams::FRAME_PING, id: 0, off: 0, cum: 0, sacks: vec![], data: vec![] });
         s.note_ping_sent(tick);
@@ -392,9 +394,11 @@ impl Node {
                     return vec![];
                 }
             };
+            let peer = half.peer.clone();
             self.half_open.remove(&conn);
             // The confirming packet names the peer.
             s.peer_addr = from;
+            s.peer_name = peer;
             s.note_heard(tick);
             self.sessions.insert(conn, s);
             self.stats.sessions_allocated += 1;
@@ -441,6 +445,38 @@ impl Node {
             return h.from;
         }
         ADDR_ANY
+    }
+
+    // The name recorded at the handshake for a confirmed session; None for
+    // an unknown conn, a pending attempt, or a half-open entry.
+    pub fn peer_of(&self, conn: u64) -> Option<&str> {
+        self.sessions.get(&conn).map(|s| s.peer_name.as_str())
+    }
+
+    // The conn id of a confirmed session in state Open whose recorded peer
+    // name equals `peer`. If several match, the one with the greatest
+    // last_heard(). Survives a retry: the new attempt's conn id replaces the
+    // one `connect` returned.
+    pub fn session_with(&self, peer: &str) -> Option<u64> {
+        self.sessions
+            .iter()
+            .filter(|(_, s)| s.state == crate::session::State::Open && s.peer_name == peer)
+            .max_by_key(|(_, s)| s.last_heard())
+            .map(|(c, _)| *c)
+    }
+
+    // True while any pending handshake attempt is addressed to this peer
+    // name: the node has not given up yet.
+    pub fn is_connecting_to(&self, peer: &str) -> bool {
+        self.pending_init.values().any(|p| p.peer == peer)
+    }
+
+    // True if any live handshake or session is addressed to this source id:
+    // replies for it would be lost if the endpoint forgot the address.
+    pub fn addr_in_use(&self, addr: Addr) -> bool {
+        self.sessions.values().any(|s| s.peer_addr == addr)
+            || self.pending_init.values().any(|p| p.to == addr)
+            || self.half_open.values().any(|h| h.from == addr)
     }
 
     // Drop an unfinished initiator attempt (app-side retry).
