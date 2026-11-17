@@ -143,6 +143,39 @@ fn addresses_in_use_are_never_evicted() {
     assert_eq!(got, data);
 }
 
+// One poll: receive at most the cap, run the timers, then send. A junk flood
+// at the cap must not starve the send step: the queued file datagrams still
+// move in the same poll.
+#[test]
+fn a_flood_does_not_stop_the_send_step() {
+    let (mut a, mut b) = pair_with_b_capacity(4096);
+    let conn = a.connect("bob", b.local_addr()).unwrap();
+    pump(&mut a, &mut b, |a, b| a.node.is_open(conn) && b.node.is_open(conn), 10);
+
+    let conn_b = b.node.session_with("alice").expect("b holds a session with alice");
+
+    let data: Vec<u8> = (0..200_000u64).map(|i| (i.wrapping_mul(31).wrapping_add(i / 1000)) as u8).collect();
+    b.send_bytes(conn_b, 1, &data);
+    let q0 = b.queued();
+    assert!(q0 > 0, "sending 200000 bytes must leave datagrams queued");
+
+    let raw = UdpSocket::bind("127.0.0.1:0").unwrap();
+    for i in 0..400u32 {
+        let dgram = [b'f', (i % 251) as u8, (i / 251) as u8, (i % 97) as u8, 0x21];
+        raw.send_to(&dgram, b.local_addr()).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(20));
+
+    let got = b.poll().unwrap();
+    assert_eq!(got, MAX_RECV_PER_POLL, "one poll did not stop at the cap");
+    assert!(
+        b.queued() < q0,
+        "the send step did not run while the flood still waited: queued {} was not under q0 {}",
+        b.queued(),
+        q0
+    );
+}
+
 #[test]
 fn sends_are_paced_by_time_not_by_poll_calls() {
     let (mut a, mut b) = pair_with_b_capacity(4096);

@@ -30,6 +30,39 @@ fn both_sides_know_the_peer_name() {
     assert_eq!(b.peer_of(conn), Some("alice"));
 }
 
+// A retry moves the session under a new conn id: the id connect returned is
+// dead, and the caller must be able to ask the node for the live one.
+#[test]
+fn session_with_finds_the_session_after_a_retry() {
+    let (mut a, mut b) = pair();
+    let (conn0, _hs1) = a.connect_at("bob", None, 0).unwrap();
+    // Never deliver that attempt's datagrams: drive a's timers and keep the
+    // last datagram of the round.
+    let mut last: Option<(u64, Vec<u8>)> = None;
+    for t in 1..=9u64 {
+        for entry in a.tick_sessions(t, 2) {
+            last = Some(entry);
+        }
+    }
+    let (retry_conn, hs1) = last.expect("the retry datagram was seen");
+    assert_ne!(retry_conn, conn0, "the second attempt uses a new conn id");
+
+    let hs2 = b.on_datagram(&hs1, 9);
+    assert_eq!(hs2.len(), 1, "responder answers the retry: {:?}", b.stats);
+    let confirm = a.on_datagram(&hs2[0], 9);
+    assert_eq!(confirm.len(), 1, "initiator proves its keys with one packet");
+    let reply = b.on_datagram(&confirm[0], 9);
+    assert_eq!(reply.len(), 1, "responder answers the confirming PING");
+    assert!(a.on_datagram(&reply[0], 9).is_empty());
+
+    let c = a.session_with("bob").expect("the live session is findable by name");
+    assert_ne!(c, conn0, "the dead conn id connect returned is not the session");
+    assert_eq!(c, retry_conn);
+    assert!(a.is_open(c));
+    assert_eq!(a.session_with("carol"), None);
+    assert!(!a.is_connecting_to("bob"));
+}
+
 #[test]
 fn a_half_open_or_unknown_conn_has_no_peer() {
     let (mut a, mut b) = pair();

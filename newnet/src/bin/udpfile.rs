@@ -163,14 +163,22 @@ fn main() {
             Some(t) => t,
             None => usage(),
         };
-        let conn = match ep.connect(&o.peer, to) {
-            Ok(c) => c,
-            Err(e) => fail(format!("cannot connect to {}: {e:?}", o.peer)),
-        };
+        // The conn id connect returned can die under a retry: the node starts
+        // a fresh attempt under a new id. Follow the session by peer name
+        // instead of holding the id.
+        if let Err(e) = ep.connect(&o.peer, to) {
+            fail(format!("cannot connect to {}: {e:?}", o.peer));
+        }
         let start = Instant::now();
-        while !ep.node.is_open(conn) {
+        let conn = loop {
             if timed_out(start, o.timeout_secs) {
                 fail("timed out");
+            }
+            if let Some(c) = ep.node.session_with(&o.peer) {
+                break c;
+            }
+            if !ep.node.is_connecting_to(&o.peer) {
+                fail("peer did not answer");
             }
             match ep.poll() {
                 Ok(r) => {
@@ -180,13 +188,18 @@ fn main() {
                 }
                 Err(e) => fail(format!("poll failed: {e}")),
             }
-        }
+        };
         ep.send_bytes(conn, 1, &(data.len() as u64).to_le_bytes());
         ep.send_bytes(conn, 1, &data);
         loop {
-            let s = ep.node.sessions.get(&conn);
-            let done = ep.queued() == 0
-                && matches!(s, Some(s) if s.in_flight_total() == 0 && s.queued_chunks() == 0);
+            if !ep.node.sessions.contains_key(&conn) {
+                fail("session ended before the file was acknowledged");
+            }
+
+            let done = {
+                let s = ep.node.sessions.get(&conn).unwrap();
+                ep.queued() == 0 && s.in_flight_total() == 0 && s.queued_chunks() == 0
+            };
             if done {
                 break;
             }
@@ -202,13 +215,13 @@ fn main() {
                 Err(e) => fail(format!("poll failed: {e}")),
             }
         }
+        // The tail is not subject to --timeout-secs: it has its own bound.
+        // Close the session and let the CLOSE datagram leave.
         ep.close(conn);
-        for _ in 0..5 {
+        let tail = Instant::now();
+        while ep.queued() > 0 && tail.elapsed() < Duration::from_secs(2) {
             if let Err(e) = ep.poll() {
                 fail(format!("poll failed: {e}"));
-            }
-            if ep.queued() == 0 {
-                break;
             }
         }
         println!("sent {} bytes", data.len());
@@ -251,25 +264,50 @@ fn main() {
                 fail("session ended before the file was complete");
             }
             buf.extend(ep.node.take_stream_bytes(c, 1));
+            // The tool only reads stream 1: take and drop whatever the peer
+            // delivered on every other stream so it cannot pile up.
+            let others: Vec<u32> = ep
+                .node
+                .sessions
+                .get(&c)
+                .map(|s| s.delivered.keys().copied().filter(|id| *id != 1).collect())
+                .unwrap_or_default();
+            for id in others {
+                ep.node.take_stream_bytes(c, id);
+            }
             match frame_length(&buf, MAX_FILE_BYTES) {
                 Ok(None) => {}
                 Err(msg) => fail(msg),
                 Ok(Some(n)) => {
                     if buf.len() >= 8 && buf.len() - 8 >= n {
-                        if let Err(e) = std::fs::write(&out, &buf[8..8 + n]) {
+                        // Write safely: fill <out>.part, then rename it into
+                        // place. On any failure the .part file is removed, so
+                        // a failed run leaves nothing at the output path.
+                        let mut part_os = out.clone().into_os_string();
+                        part_os.push(".part");
+                        let part = PathBuf::from(part_os);
+                        if let Err(e) = std::fs::write(&part, &buf[8..8 + n]) {
+                            let _ = std::fs::remove_file(&part);
                             fail(format!("cannot write the output file {}: {e}", out.display()));
                         }
-                        // Let the final ACKs leave before exiting: the sender
-                        // waits for them before it closes.
-                        loop {
-                            if ep.queued() == 0 {
-                                break;
-                            }
-                            if let Err(e) = ep.poll() {
-                                fail(format!("poll failed: {e}"));
-                            }
+                        if let Err(e) = std::fs::rename(&part, &out) {
+                            let _ = std::fs::remove_file(&part);
+                            fail(format!("cannot move {} to {}: {e}", part.display(), out.display()));
                         }
                         println!("received {n} bytes");
+                        // The tail is not subject to --timeout-secs: it has
+                        // its own bound. Keep polling so the final ACKs leave
+                        // and the sender's CLOSE arrives. The receiver never
+                        // closes the session itself: it ends when the sender
+                        // closes it, or after 3 seconds from the write. Poll
+                        // errors are ignored: the file is already complete.
+                        let written = Instant::now();
+                        while ep.node.peer_of(c).is_some() && written.elapsed() < Duration::from_secs(3) {
+                            let got = ep.poll().unwrap_or(0);
+                            if got == 0 && ep.queued() == 0 {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        }
                         exit(0);
                     }
                 }

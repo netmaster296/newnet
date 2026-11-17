@@ -1,5 +1,6 @@
 // The udpfile binary driven as two real processes over loopback UDP.
 
+use std::io::Read;
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -20,6 +21,12 @@ fn temp_path(test: &str, tag: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("udpfile_cli_{}_{test}_{tag}", std::process::id()));
     p
+}
+
+fn part_path(out: &Path) -> PathBuf {
+    let mut s = out.as_os_str().to_os_string();
+    s.push(".part");
+    PathBuf::from(s)
 }
 
 fn spawn(args: &[String]) -> Child {
@@ -47,6 +54,20 @@ impl Guard {
 
     fn spawn(&mut self, args: &[String]) -> usize {
         self.children.push(spawn(args));
+        self.children.len() - 1
+    }
+
+    // Like spawn, but the child's stderr is piped so the test can read it
+    // after the child exits.
+    fn spawn_stderr(&mut self, args: &[String]) -> usize {
+        let child = udpfile()
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        self.children.push(child);
         self.children.len() - 1
     }
 
@@ -152,6 +173,33 @@ fn a_file_crosses_between_two_processes() {
     assert_eq!(got, data, "the output file must equal the input file");
 }
 
+// The sender keeps retrying its handshake: a receiver that starts three
+// seconds late must still complete the transfer.
+#[test]
+fn the_receiver_may_start_three_seconds_late() {
+    let mut g = Guard::new();
+    let input = temp_path("the_receiver_may_start_three_seconds_late", "in");
+    let output = temp_path("the_receiver_may_start_three_seconds_late", "out");
+    g.file(&input);
+    g.file(&output);
+    let data: Vec<u8> = (0..200_000u64)
+        .map(|i| (i.wrapping_mul(31).wrapping_add(i / 1000)) as u8)
+        .collect();
+    std::fs::write(&input, &data).unwrap();
+    let port = free_port();
+
+    let s = g.spawn(&send_args(port, &input, "2", "40"));
+    std::thread::sleep(Duration::from_secs(3));
+    let r = g.spawn(&recv_args(port, &output, "40"));
+
+    let rc_send = g.wait_exit(s, 90);
+    let rc_recv = g.wait_exit(r, 90);
+    let got = std::fs::read(&output).unwrap_or_default();
+    assert_eq!(rc_send, 0, "send must exit 0");
+    assert_eq!(rc_recv, 0, "recv must exit 0");
+    assert_eq!(got, data, "the output file must equal the input file");
+}
+
 #[test]
 fn a_wrong_peer_key_transfers_nothing() {
     let mut g = Guard::new();
@@ -163,15 +211,56 @@ fn a_wrong_peer_key_transfers_nothing() {
     std::fs::write(&input, &data).unwrap();
     let port = free_port();
 
+    let r = g.spawn_stderr(&recv_args(port, &output, "3"));
+    let s = g.spawn_stderr(&send_args(port, &input, "999", "3"));
+
+    let rc_send = g.wait_exit(s, 30);
+    let rc_recv = g.wait_exit(r, 30);
+    let mut send_err = String::new();
+    let mut recv_err = String::new();
+    g.children[s].stderr.as_mut().unwrap().read_to_string(&mut send_err).unwrap();
+    g.children[r].stderr.as_mut().unwrap().read_to_string(&mut recv_err).unwrap();
+    let existed = output.exists();
+    assert_eq!(rc_send, 1, "send with a wrong peer key must exit 1");
+    assert_eq!(rc_recv, 1, "recv must exit 1");
+    assert!(!existed, "the output file must not exist");
+    assert!(recv_err.contains("timed out"), "recv stderr must report the timeout, got: {recv_err}");
+    assert!(
+        send_err.contains("timed out") || send_err.contains("peer did not answer"),
+        "send stderr must report the failure, got: {send_err}"
+    );
+    assert!(
+        !send_err.contains("cannot bind") && !send_err.contains("cannot read"),
+        "send must not fail on bind or read, got: {send_err}"
+    );
+    assert!(
+        !recv_err.contains("cannot bind") && !recv_err.contains("cannot read"),
+        "recv must not fail on bind or read, got: {recv_err}"
+    );
+}
+
+#[test]
+fn nothing_is_left_at_the_output_path_on_failure() {
+    let mut g = Guard::new();
+    let input = temp_path("nothing_is_left_at_the_output_path_on_failure", "in");
+    let output = temp_path("nothing_is_left_at_the_output_path_on_failure", "out");
+    let part = part_path(&output);
+    g.file(&input);
+    g.file(&output);
+    g.file(&part);
+    let data = sample_data();
+    std::fs::write(&input, &data).unwrap();
+    let port = free_port();
+
     let r = g.spawn(&recv_args(port, &output, "3"));
     let s = g.spawn(&send_args(port, &input, "999", "3"));
 
     let rc_send = g.wait_exit(s, 30);
     let rc_recv = g.wait_exit(r, 30);
-    let existed = output.exists();
     assert_eq!(rc_send, 1, "send with a wrong peer key must exit 1");
     assert_eq!(rc_recv, 1, "recv must exit 1");
-    assert!(!existed, "the output file must not exist");
+    assert!(!output.exists(), "the output file must not exist after a failed run");
+    assert!(!part.exists(), "no .part file may be left after a failed run");
 }
 
 #[test]

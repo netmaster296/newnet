@@ -453,6 +453,24 @@ impl Node {
         self.sessions.get(&conn).map(|s| s.peer_name.as_str())
     }
 
+    // The conn id of a confirmed session in state Open whose recorded peer
+    // name equals `peer`. If several match, the one with the greatest
+    // last_heard(). Survives a retry: the new attempt's conn id replaces the
+    // one `connect` returned.
+    pub fn session_with(&self, peer: &str) -> Option<u64> {
+        self.sessions
+            .iter()
+            .filter(|(_, s)| s.state == crate::session::State::Open && s.peer_name == peer)
+            .max_by_key(|(_, s)| s.last_heard())
+            .map(|(c, _)| *c)
+    }
+
+    // True while any pending handshake attempt is addressed to this peer
+    // name: the node has not given up yet.
+    pub fn is_connecting_to(&self, peer: &str) -> bool {
+        self.pending_init.values().any(|p| p.peer == peer)
+    }
+
     // True if any live handshake or session is addressed to this source id:
     // replies for it would be lost if the endpoint forgot the address.
     pub fn addr_in_use(&self, addr: Addr) -> bool {
