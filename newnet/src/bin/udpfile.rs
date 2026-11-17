@@ -195,9 +195,19 @@ fn main() {
                 fail(format!("file exceeds the limit of {MAX_FILE_BYTES} bytes"));
             }
         }
-        let data = match std::fs::read(&file) {
-            Ok(d) => d,
-            Err(e) => fail(format!("cannot read the input file {}: {e}", file.display())),
+        // The reported size can be wrong (a device, a pipe, a file that is
+        // still growing), so the read itself is bounded as well.
+        let data = {
+            use std::io::Read;
+            let mut d = Vec::new();
+            let read = std::fs::File::open(&file).and_then(|f| f.take(MAX_FILE_BYTES + 1).read_to_end(&mut d));
+            if let Err(e) = read {
+                fail(format!("cannot read the input file {}: {e}", file.display()));
+            }
+            if too_big(d.len() as u64) {
+                fail(format!("file exceeds the limit of {MAX_FILE_BYTES} bytes"));
+            }
+            d
         };
         let mut ep = match UdpEndpoint::bind(node_with_peer(&o), &listen.to_string()) {
             Ok(e) => e,
