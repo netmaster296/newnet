@@ -55,6 +55,7 @@ impl UdpEndpoint {
         socket.set_nonblocking(true)?;
         let epoch_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         node.set_stamp_base(epoch_ms);
+        node.set_stamp_floor(epoch_ms.saturating_sub(300_000));
         Ok(UdpEndpoint {
             node,
             socket,

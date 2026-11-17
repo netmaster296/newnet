@@ -24,6 +24,13 @@ use crate::wire;
 // One tick is 1 ms, so this TTL is 400 ms.
 pub const HALF_OPEN_TTL: u64 = 400;
 pub const MAX_HALF_OPEN: usize = 64;
+// One enrolled peer name never holds more than this many half-open entries:
+// the oldest of them is evicted to admit a newer (spec step 5).
+pub const MAX_HALF_OPEN_PER_PEER: usize = 2;
+// Session caps (spec step 5): a node holds at most this many sessions; one
+// peer name at most this many, its least recently heard closing first.
+pub const MAX_SESSIONS: usize = 64;
+pub const MAX_SESSIONS_PER_PEER: usize = 4;
 pub const HS_RESENDS: u32 = 3;
 pub const HS_ATTEMPTS: u32 = 3;
 
@@ -67,6 +74,10 @@ pub struct NodeStats {
     pub cookies_sent: u64,
     pub cookies_received: u64,
     pub hs1_bad_size: u64,
+    pub hs_stamp_floor_dropped: u64,
+    pub half_open_evicted: u64,
+    pub sessions_refused_full: u64,
+    pub sessions_evicted_peer: u64,
 }
 
 struct PendingInit {
@@ -104,6 +115,10 @@ pub struct Node {
     half_open: HashMap<u64, HalfOpen>,
     last_stamp: HashMap<String, u64>, // greatest Hello.stamp accepted per peer name
     next_stamp: u64,
+    // Accepted Hello stamps must exceed this (step 5): a real endpoint sets
+    // it to process-start wall clock minus 300 s, so a recording older than
+    // five minutes cannot re-open state after a restart.
+    stamp_floor: u64,
     pub readers: HashMap<(u64, u32), Reader>,
     pub stats: NodeStats,
     pub logs: Vec<String>,
@@ -130,6 +145,7 @@ impl Node {
             half_open: HashMap::new(),
             last_stamp: HashMap::new(),
             next_stamp: 0,
+            stamp_floor: 0,
             readers: HashMap::new(),
             stats: NodeStats::default(),
             logs: Vec::new(),
@@ -207,6 +223,12 @@ impl Node {
         self.next_stamp
     }
 
+    // Responder floor (step 5): an accepted stamp must exceed this as well
+    // as the per-name table. UdpEndpoint::bind sets it at start.
+    pub fn set_stamp_floor(&mut self, floor: u64) {
+        self.stamp_floor = floor;
+    }
+
     // One handshake attempt: fresh IK machine bound to conn via prologue,
     // Hello(stamp, name) as the msg1 payload, stored for identical resends.
     fn start_attempt(&mut self, name: &str, eph: Option<[u8; 32]>, tick: u64, attempt: u32, to: Addr) -> Result<(u64, Vec<u8>), ConnectError> {
@@ -238,6 +260,25 @@ impl Node {
 
     pub fn half_open_count(&self) -> usize {
         self.half_open.len()
+    }
+
+    // Room for one new session for `peer` (step 5): a fifth session for one
+    // name closes that name's least recently heard session; a 65th session
+    // on the node is refused outright. False means drop the creating packet.
+    fn make_session_room(&mut self, peer: &str) -> bool {
+        let mut same_name: Vec<(u64, u64)> = self.sessions.iter().filter(|(_, s)| s.peer_name == peer).map(|(c, s)| (*c, s.last_heard())).collect();
+        if same_name.len() >= MAX_SESSIONS_PER_PEER {
+            same_name.sort_by_key(|(_, heard)| *heard);
+            let (oldest, _) = same_name[0];
+            self.sessions.remove(&oldest);
+            self.stats.sessions_evicted_peer += 1;
+            self.logs.push(format!("session evicted conn={oldest}: peer {peer} over per-peer cap"));
+        }
+        if self.sessions.len() >= MAX_SESSIONS {
+            self.stats.sessions_refused_full += 1;
+            return false;
+        }
+        true
     }
 
     pub fn pending_count(&self) -> usize {
@@ -370,12 +411,29 @@ impl Node {
             self.stats.auth_fails += 1;
             return vec![];
         }
-        // Stamps are per name and strictly increasing: a recorded HS1 can
-        // never re-open state, even under a fresh conn id.
+        // Stamps are per name and strictly increasing, and must clear the
+        // floor (step 5): a recorded HS1 can never re-open state, even
+        // under a fresh conn id and an empty stamp table.
+        if hello.stamp <= self.stamp_floor {
+            self.stats.hs_stamp_floor_dropped += 1;
+            self.stats.auth_fails += 1;
+            self.logs.push(format!("stamp below floor conn={conn} stamp={} floor={}", hello.stamp, self.stamp_floor));
+            return vec![];
+        }
         if hello.stamp <= self.last_stamp.get(&hello.name).copied().unwrap_or(0) {
             self.stats.hs_replay_dropped += 1;
             self.stats.auth_fails += 1;
             return vec![];
+        }
+        // Per-peer half-open cap (step 5): an enrolled name holds at most
+        // MAX_HALF_OPEN_PER_PEER entries; the oldest of them makes room.
+        let mut same_name: Vec<(u64, u64)> = self.half_open.iter().filter(|(_, h)| h.peer == hello.name).map(|(c, h)| (*c, h.created)).collect();
+        if same_name.len() >= MAX_HALF_OPEN_PER_PEER {
+            same_name.sort_by_key(|(_, created)| *created);
+            let (oldest, _) = same_name[0];
+            self.half_open.remove(&oldest);
+            self.stats.half_open_evicted += 1;
+            self.logs.push(format!("half-open evicted conn={oldest}: peer {} over per-peer cap", hello.name));
         }
         if self.half_open.len() >= MAX_HALF_OPEN {
             self.stats.half_open_dropped_full += 1;
@@ -449,6 +507,10 @@ impl Node {
             }
         };
         let removed = self.pending_init.remove(&conn).unwrap();
+        if !self.make_session_room(&removed.peer) {
+            self.logs.push(format!("session refused conn={conn}: node at {MAX_SESSIONS} sessions"));
+            return vec![];
+        }
         let mut s = Session::from_split(conn, &keys, true);
         // Follow the packet; fall back to the recorded destination when the
         // reply arrived with an unknown source.
@@ -500,6 +562,11 @@ impl Node {
                 }
             };
             let peer = half.peer.clone();
+            if !self.make_session_room(&peer) {
+                self.logs.push(format!("session refused conn={conn}: node at {MAX_SESSIONS} sessions"));
+                // The half-open entry stays: the confirming packet is dropped.
+                return vec![];
+            }
             self.half_open.remove(&conn);
             // The confirming packet names the peer.
             s.peer_addr = from;

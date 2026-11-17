@@ -253,6 +253,11 @@ fn half_open_is_reaped_even_after_junk_data() {
 fn half_open_table_is_bounded() {
     let (mut a, mut b) = pair();
     for i in 0..(MAX_HALF_OPEN as u64 + 6) {
+        // One name holds at most MAX_HALF_OPEN_PER_PEER half-open entries
+        // (step 5), so filling the global table takes one name per conn.
+        let name = format!("peer{i}");
+        a.name = name.clone();
+        b.records.insert(name.clone(), PeerRecord { name: name.clone(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX });
         let (_c, hs1) = a.connect("bob", None).unwrap();
         let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
         b.on_datagram(&hs1, 100 + i * BUDGET_EPOCH_TICKS); // a new budget epoch each time, so the DH budget is not the limit
