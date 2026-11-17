@@ -8,8 +8,8 @@ fn pair() -> (Node, Node) {
     let a = Node::new("alice", 0xA11CE);
     let b = Node::new("bob", 0xB0B);
     let (mut a, mut b) = (a, b);
-    let rec_b = PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, cert: vec![] };
-    let rec_a = PeerRecord { name: "alice".into(), ed: a.ident.ed_pub(), x: a.ident.x_pub, cert: vec![] };
+    let rec_b = PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX };
+    let rec_a = PeerRecord { name: "alice".into(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX };
     a.records.insert("bob".into(), rec_b);
     b.records.insert("alice".into(), rec_a);
     (a, b)
@@ -45,7 +45,7 @@ fn wrong_pinned_key_fails_handshake() {
     let wrong = Node::new("ghost", 0x6057);
     b.records.insert(
         "alice".into(),
-        PeerRecord { name: "alice".into(), ed: wrong.ident.ed_pub(), x: wrong.ident.x_pub, cert: vec![] },
+        PeerRecord { name: "alice".into(), ed: wrong.ident.ed_pub(), x: wrong.ident.x_pub, expiry: u64::MAX },
     );
     let (_conn, hs1) = a.connect("bob", Some([2u8; 32])).unwrap();
     let hs2s = b.on_datagram(&hs1, 1);

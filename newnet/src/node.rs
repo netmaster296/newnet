@@ -105,11 +105,11 @@ impl Node {
 
     pub fn lookup_name(&self, name: &str) -> Option<PeerRecord> {
         if let Some(r) = self.records.get(name) {
-            return Some(PeerRecord { name: r.name.clone(), ed: r.ed, x: r.x, cert: r.cert.clone() });
+            return Some(PeerRecord { name: r.name.clone(), ed: r.ed, x: r.x, expiry: r.expiry });
         }
         let reg = self.registry.as_ref()?;
         let rec = reg.get(name)?;
-        Some(PeerRecord { name: rec.name.clone(), ed: VerifyingKey::from_bytes(&rec.ed).ok()?, x: rec.x_pub(), cert: vec![] })
+        Some(PeerRecord { name: rec.name.clone(), ed: VerifyingKey::from_bytes(&rec.ed).ok()?, x: rec.x_pub(), expiry: rec.expiry })
     }
 
     // TOFU pin store feeds the record cache. Pin mismatch fails closed.
@@ -119,9 +119,20 @@ impl Node {
             .map_err(ConnectError::Pin)?;
         self.records.insert(
             rec.name.clone(),
-            PeerRecord { name: rec.name.clone(), ed: VerifyingKey::from_bytes(&rec.ed).map_err(|_| ConnectError::NoRecord)?, x: rec.x_pub(), cert: vec![] },
+            PeerRecord { name: rec.name.clone(), ed: VerifyingKey::from_bytes(&rec.ed).map_err(|_| ConnectError::NoRecord)?, x: rec.x_pub(), expiry: rec.expiry },
         );
         Ok(())
+    }
+
+    fn resolve(&mut self, name: &str, now: u64) -> Result<PeerRecord, ConnectError> {
+        let rec = self.lookup_name(name).ok_or(ConnectError::NoRecord)?;
+        if rec.expiry < now {
+            return Err(ConnectError::Pin(crate::identity::IdentityError::CertExpired));
+        }
+        self.pins
+            .check_or_pin(&rec.name, rec.ed.to_bytes(), rec.x.to_bytes(), rec.expiry, now)
+            .map_err(ConnectError::Pin)?;
+        Ok(rec)
     }
 
     pub fn connect(&mut self, name: &str, eph: Option<[u8; 32]>) -> Result<(u64, Vec<u8>), ConnectError> {
@@ -136,7 +147,7 @@ impl Node {
     // One handshake attempt: fresh IK machine bound to conn via prologue,
     // Hello(stamp, name) as the msg1 payload, stored for identical resends.
     fn start_attempt(&mut self, name: &str, eph: Option<[u8; 32]>, tick: u64, attempt: u32) -> Result<(u64, Vec<u8>), ConnectError> {
-        let rec = self.lookup_name(name).ok_or(ConnectError::NoRecord)?;
+        let rec = self.resolve(name, tick)?;
         let conn = self.next_conn;
         self.next_conn = self.next_conn.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         self.next_stamp += 1;
@@ -230,9 +241,9 @@ impl Node {
                 return vec![];
             }
         };
-        let rec = match self.lookup_name(&hello.name) {
-            Some(r) => r,
-            None => {
+        let rec = match self.resolve(&hello.name, tick) {
+            Ok(r) => r,
+            Err(_) => {
                 self.stats.auth_fails += 1;
                 return vec![];
             }
@@ -373,7 +384,7 @@ impl Node {
             Some(s) => s,
             None => return vec![],
         };
-        let frames = s.tx_streams.entry(stream).or_default().send(stream, &content::put(m), 0);
+        let frames = s.queue_stream_bytes(stream, &content::put(m), 0);
         frames.iter().map(|f| s.seal_frame(f)).collect()
     }
 
@@ -383,7 +394,7 @@ impl Node {
             Some(s) => s,
             None => return vec![],
         };
-        let frames = s.tx_streams.entry(stream).or_default().send(stream, bytes, tick);
+        let frames = s.queue_stream_bytes(stream, bytes, tick);
         frames.iter().map(|f| s.seal_frame(f)).collect()
     }
 

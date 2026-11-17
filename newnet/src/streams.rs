@@ -160,6 +160,14 @@ impl StreamTx {
         frames
     }
 
+    // Arm one queued chunk at its already-assigned offset and return the
+    // frame for its first transmission.
+    pub fn start(&mut self, id: u32, off: u64, chunk: Vec<u8>, now: u64) -> Frame {
+        let f = mk_stream(id, off, &chunk);
+        self.in_flight.insert(off, (chunk, now));
+        f
+    }
+
     fn covered(&self, off: u64, end: u64) -> bool {
         if end < self.acked {
             return true;
