@@ -443,6 +443,14 @@ impl Node {
         ADDR_ANY
     }
 
+    // True if any live handshake or session is addressed to this source id:
+    // replies for it would be lost if the endpoint forgot the address.
+    pub fn addr_in_use(&self, addr: Addr) -> bool {
+        self.sessions.values().any(|s| s.peer_addr == addr)
+            || self.pending_init.values().any(|p| p.to == addr)
+            || self.half_open.values().any(|h| h.from == addr)
+    }
+
     // Drop an unfinished initiator attempt (app-side retry).
     pub fn connect_cleanup(&mut self, conn: u64) {
         self.pending_init.remove(&conn);
