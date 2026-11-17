@@ -19,6 +19,10 @@ pub const MAX_PEERS: usize = 4096;
 // A flood must not starve the timers or the send step: one poll drains at
 // most this many datagrams and the rest wait for the next poll.
 pub const MAX_RECV_PER_POLL: usize = 256;
+// Ceiling on queued outgoing datagrams. A dropped ACK goes out again when
+// the data is retransmitted; dropped data is retransmitted by the stream
+// timers, so a full queue slows a transfer but cannot break it.
+pub const MAX_OUT: usize = 8192;
 
 pub struct UdpEndpoint {
     pub node: Node,
@@ -31,6 +35,11 @@ pub struct UdpEndpoint {
     out: VecDeque<(SocketAddr, Vec<u8>)>,
     send_tick: u64,
     sent_this_tick: usize,
+    max_out: usize,
+    // Datagrams the OS refused at send time (dropped, poll goes on).
+    pub send_errors: u64,
+    // Datagrams dropped because the outgoing queue was full.
+    pub dropped_out: u64,
 }
 
 impl UdpEndpoint {
@@ -54,6 +63,9 @@ impl UdpEndpoint {
             out: VecDeque::new(),
             send_tick: 0,
             sent_this_tick: 0,
+            max_out: MAX_OUT,
+            send_errors: 0,
+            dropped_out: 0,
         })
     }
 
@@ -100,8 +112,16 @@ impl UdpEndpoint {
         i
     }
 
+    pub fn set_max_out(&mut self, n: usize) {
+        self.max_out = n;
+    }
+
     fn queue_to(&mut self, addr: Addr, dgram: Vec<u8>) {
         if addr == ADDR_ANY || addr as usize >= self.peers.len() {
+            return;
+        }
+        if self.out.len() >= self.max_out {
+            self.dropped_out += 1;
             return;
         }
         let sa = self.peers[addr as usize];
@@ -173,7 +193,13 @@ impl UdpEndpoint {
                     self.out.push_front((sa, dgram));
                     break;
                 }
-                Err(e) => return Err(e),
+                // A destination the OS refuses (broadcast, unspecified) must
+                // not stop the endpoint: drop this datagram and go on. Dropped
+                // ACKs and data come back through the timers.
+                Err(_) => {
+                    self.send_errors += 1;
+                    continue;
+                }
             }
         }
         Ok(received)

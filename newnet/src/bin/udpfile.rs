@@ -4,7 +4,7 @@
 //   udpfile send --name alice --seed 1 --peer bob --peer-seed 2 --to 127.0.0.1:4002 --file input.bin [--listen 127.0.0.1:0] [--timeout-secs 30]
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::{Duration, Instant};
 
@@ -39,8 +39,19 @@ struct Opts {
     timeout_secs: u64,
 }
 
+// Pure limit check: the sender refuses a file longer than the cap before
+// it binds or reads the bytes.
+fn too_big(len: u64) -> bool {
+    len > MAX_FILE_BYTES
+}
+
 fn parse() -> Opts {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // args_os: an argument that is not valid Unicode is a malformed
+    // argument, not a panic.
+    let args: Vec<String> = match std::env::args_os().skip(1).map(|a| a.into_string()).collect() {
+        Ok(v) => v,
+        Err(_) => usage(),
+    };
     let mut o = Opts {
         mode: String::new(),
         name: String::new(),
@@ -136,6 +147,33 @@ fn frame_length(buf: &[u8], max: u64) -> Result<Option<usize>, String> {
     Ok(Some(n as usize))
 }
 
+// The path of the staging file for `out`.
+fn part_of(out: &Path) -> PathBuf {
+    let mut s = out.as_os_str().to_os_string();
+    s.push(".part");
+    PathBuf::from(s)
+}
+
+// The receiver checks its output path at startup, before binding: one bad
+// path must fail at once, not after a whole transfer has crossed.
+fn probe_out(out: &Path) {
+    if out.is_dir() {
+        fail(format!("cannot write to {}: {} is an existing directory", out.display(), out.display()));
+    }
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            fail(format!("cannot write to {}: the directory {} does not exist", out.display(), parent.display()));
+        }
+    }
+    let part = part_of(out);
+    match std::fs::File::create(&part) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&part);
+        }
+        Err(e) => fail(format!("cannot write to {}: {e}", out.display())),
+    }
+}
+
 fn main() {
     let o = parse();
     let listen: SocketAddr = match &o.listen {
@@ -148,12 +186,18 @@ fn main() {
     warn_lab_only(&listen);
 
     if o.mode == "send" {
-        let data = match &o.file {
-            Some(f) => match std::fs::read(f) {
-                Ok(d) => d,
-                Err(e) => fail(format!("cannot read the input file {}: {e}", f.display())),
-            },
+        let file = match &o.file {
+            Some(f) => f.clone(),
             None => usage(),
+        };
+        if let Ok(m) = std::fs::metadata(&file) {
+            if too_big(m.len()) {
+                fail(format!("file exceeds the limit of {MAX_FILE_BYTES} bytes"));
+            }
+        }
+        let data = match std::fs::read(&file) {
+            Ok(d) => d,
+            Err(e) => fail(format!("cannot read the input file {}: {e}", file.display())),
         };
         let mut ep = match UdpEndpoint::bind(node_with_peer(&o), &listen.to_string()) {
             Ok(e) => e,
@@ -215,6 +259,27 @@ fn main() {
                 Err(e) => fail(format!("poll failed: {e}")),
             }
         }
+        // Acknowledged stream 1 means the bytes arrived, not that the file
+        // was stored. Wait for the receiver's one-byte verdict on stream 2;
+        // the --timeout-secs deadline still applies.
+        let mut confirm: Vec<u8> = Vec::new();
+        while confirm.is_empty() {
+            if timed_out(start, o.timeout_secs) {
+                fail("timed out");
+            }
+            if ep.node.peer_of(conn).is_none() {
+                fail("session ended before the receiver confirmed");
+            }
+            confirm.extend(ep.node.take_stream_bytes(conn, 2));
+            match ep.poll() {
+                Ok(r) => {
+                    if r == 0 && ep.queued() == 0 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Err(e) => fail(format!("poll failed: {e}")),
+            }
+        }
         // The tail is not subject to --timeout-secs: it has its own bound.
         // Close the session and let the CLOSE datagram leave.
         ep.close(conn);
@@ -224,6 +289,10 @@ fn main() {
                 fail(format!("poll failed: {e}"));
             }
         }
+        if confirm[0] != 0 {
+            eprintln!("receiver could not store the file");
+            exit(1);
+        }
         println!("sent {} bytes", data.len());
         exit(0);
     }
@@ -232,6 +301,7 @@ fn main() {
         Some(p) => p.clone(),
         None => usage(),
     };
+    probe_out(&out);
     let mut ep = match UdpEndpoint::bind(node_with_peer(&o), &listen.to_string()) {
         Ok(e) => e,
         Err(e) => fail(format!("cannot bind {listen}: {e}")),
@@ -283,32 +353,40 @@ fn main() {
                         // Write safely: fill <out>.part, then rename it into
                         // place. On any failure the .part file is removed, so
                         // a failed run leaves nothing at the output path.
-                        let mut part_os = out.clone().into_os_string();
-                        part_os.push(".part");
-                        let part = PathBuf::from(part_os);
+                        let part = part_of(&out);
+                        let mut stored = true;
                         if let Err(e) = std::fs::write(&part, &buf[8..8 + n]) {
                             let _ = std::fs::remove_file(&part);
-                            fail(format!("cannot write the output file {}: {e}", out.display()));
-                        }
-                        if let Err(e) = std::fs::rename(&part, &out) {
+                            eprintln!("cannot write the output file {}: {e}", out.display());
+                            stored = false;
+                        } else if let Err(e) = std::fs::rename(&part, &out) {
                             let _ = std::fs::remove_file(&part);
-                            fail(format!("cannot move {} to {}: {e}", part.display(), out.display()));
+                            eprintln!("cannot move {} to {}: {e}", part.display(), out.display());
+                            stored = false;
                         }
-                        println!("received {n} bytes");
+                        // Tell the sender on stream 2 whether the file was
+                        // stored: 0 stored, 1 failure. This is the sender's
+                        // cue to close, so the verdict must go out even when
+                        // the write failed.
+                        ep.send_bytes(c, 2, &[if stored { 0 } else { 1 }]);
+                        if stored {
+                            println!("received {n} bytes");
+                        }
                         // The tail is not subject to --timeout-secs: it has
-                        // its own bound. Keep polling so the final ACKs leave
-                        // and the sender's CLOSE arrives. The receiver never
-                        // closes the session itself: it ends when the sender
-                        // closes it, or after 3 seconds from the write. Poll
-                        // errors are ignored: the file is already complete.
+                        // its own bound. Keep polling so the verdict and the
+                        // final ACKs leave and the sender's CLOSE arrives.
+                        // The receiver never closes the session itself: it
+                        // ends when the sender closes it, or after 10 seconds
+                        // from the write. Poll errors are ignored: the file
+                        // verdict is already decided.
                         let written = Instant::now();
-                        while ep.node.peer_of(c).is_some() && written.elapsed() < Duration::from_secs(3) {
+                        while ep.node.peer_of(c).is_some() && written.elapsed() < Duration::from_secs(10) {
                             let got = ep.poll().unwrap_or(0);
                             if got == 0 && ep.queued() == 0 {
                                 std::thread::sleep(Duration::from_millis(1));
                             }
                         }
-                        exit(0);
+                        exit(if stored { 0 } else { 1 });
                     }
                 }
             }
@@ -358,5 +436,11 @@ mod tests {
     fn a_prefix_of_max_plus_one_is_an_error() {
         let buf = prefix(MAX_FILE_BYTES + 1);
         assert!(frame_length(&buf, MAX_FILE_BYTES).is_err());
+    }
+
+    #[test]
+    fn the_size_limit_holds_at_exactly_the_cap() {
+        assert!(!too_big(MAX_FILE_BYTES));
+        assert!(too_big(MAX_FILE_BYTES + 1));
     }
 }

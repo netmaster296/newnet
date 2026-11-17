@@ -35,6 +35,11 @@ pub const MAX_RX_BUFFERED: usize = 4 * MAX_IN_FLIGHT;
 // Receive streams per session.
 pub const MAX_STREAMS: usize = 16_384;
 
+// How far ahead of a stream's `expected` offset a peer may put a chunk.
+// A peer choosing offsets near u64::MAX cannot make this side hold ranges
+// that no honest sender would ever reach.
+pub const MAX_OFFSET_AHEAD: u64 = 16 * 1024 * 1024;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum WindowOutcome {
     Fresh,
@@ -337,11 +342,15 @@ impl Session {
                 // A peer that finished the handshake is trusted to be who it
                 // says, not to be well behaved: cap what it can make this
                 // side hold. Refused frames create no state and get no ACK.
+                let expected = self.rx_streams.get(&f.id).map(|r| r.expected).unwrap_or(0);
+                if f.off > expected.saturating_add(MAX_OFFSET_AHEAD) {
+                    self.stat_overlimit += 1;
+                    return Ok(vec![]);
+                }
                 if !self.rx_streams.contains_key(&f.id) && self.rx_streams.len() >= MAX_STREAMS {
                     self.stat_overlimit += 1;
                     return Ok(vec![]);
                 }
-                let expected = self.rx_streams.get(&f.id).map(|r| r.expected).unwrap_or(0);
                 if f.off > expected && self.rx_buffered >= MAX_RX_BUFFERED {
                     self.stat_overlimit += 1;
                     return Ok(vec![]);

@@ -45,11 +45,12 @@ fn spawn(args: &[String]) -> Child {
 struct Guard {
     children: Vec<Child>,
     files: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
 }
 
 impl Guard {
     fn new() -> Guard {
-        Guard { children: Vec::new(), files: Vec::new() }
+        Guard { children: Vec::new(), files: Vec::new(), dirs: Vec::new() }
     }
 
     fn spawn(&mut self, args: &[String]) -> usize {
@@ -73,6 +74,12 @@ impl Guard {
 
     fn file(&mut self, p: &Path) {
         self.files.push(p.to_path_buf());
+    }
+
+    // Like file, for a directory the test may create at the path: removed
+    // recursively when the guard drops.
+    fn dir(&mut self, p: &Path) {
+        self.dirs.push(p.to_path_buf());
     }
 
     fn wait_exit(&mut self, idx: usize, secs: u64) -> i32 {
@@ -101,6 +108,9 @@ impl Drop for Guard {
         }
         for f in &self.files {
             let _ = std::fs::remove_file(f);
+        }
+        for d in &self.dirs {
+            let _ = std::fs::remove_dir_all(d);
         }
     }
 }
@@ -317,4 +327,65 @@ fn the_transfer_is_not_slow() {
         "the 1,500,000-byte transfer took {elapsed:?}, over the 20 s limit"
     );
     eprintln!("transfer of 1,500,000 bytes took {elapsed:?}");
+}
+
+// The receiver checks its output path at startup, before binding: with no
+// sender running at all, a path inside a directory that does not exist must
+// fail within 3 seconds.
+#[test]
+fn an_unusable_output_path_fails_at_once() {
+    let mut g = Guard::new();
+    let missing_dir = temp_path("an_unusable_output_path_fails_at_once", "nodir");
+    let output = missing_dir.join("out.bin");
+    let part = part_path(&output);
+    g.dir(&missing_dir);
+    let _ = std::fs::remove_dir_all(&missing_dir);
+    let port = free_port();
+
+    let r = g.spawn_stderr(&recv_args(port, &output, "30"));
+    let rc_recv = g.wait_exit(r, 3);
+    let mut recv_err = String::new();
+    g.children[r].stderr.as_mut().unwrap().read_to_string(&mut recv_err).unwrap();
+    assert_eq!(rc_recv, 1, "recv with --out in a missing directory must exit 1");
+    assert!(recv_err.contains("cannot write to"), "recv stderr must name the bad path, got: {recv_err}");
+    assert!(!part.exists(), "the probe .part file must be removed again");
+    assert!(!output.exists(), "the output file must not exist");
+}
+
+// The startup check passed, but the path turned into a directory while the
+// transfer ran: the rename fails, the receiver reports 1 on stream 2, and
+// the sender exits 1 with the file not stored.
+#[test]
+fn the_sender_fails_when_the_receiver_cannot_store_the_file() {
+    let mut g = Guard::new();
+    let input = temp_path("the_sender_fails_when_the_receiver_cannot_store_the_file", "in");
+    let output = temp_path("the_sender_fails_when_the_receiver_cannot_store_the_file", "out");
+    let part = part_path(&output);
+    g.file(&input);
+    g.file(&output);
+    g.file(&part);
+    g.dir(&output);
+    let data: Vec<u8> = (0..50_000u64).map(|i| (i.wrapping_mul(31).wrapping_add(i / 1000)) as u8).collect();
+    std::fs::write(&input, &data).unwrap();
+    let port = free_port();
+
+    let r = g.spawn_stderr(&recv_args(port, &output, "40"));
+    // Let the receiver's startup check pass before blocking the rename.
+    std::thread::sleep(Duration::from_millis(500));
+    std::fs::create_dir_all(&output).unwrap();
+    let s = g.spawn_stderr(&send_args(port, &input, "2", "40"));
+
+    let rc_send = g.wait_exit(s, 60);
+    let rc_recv = g.wait_exit(r, 60);
+    let mut send_err = String::new();
+    let mut recv_err = String::new();
+    g.children[s].stderr.as_mut().unwrap().read_to_string(&mut send_err).unwrap();
+    g.children[r].stderr.as_mut().unwrap().read_to_string(&mut recv_err).unwrap();
+    assert_eq!(rc_send, 1, "send must exit 1 when the receiver cannot store the file");
+    assert!(
+        send_err.contains("receiver could not store the file"),
+        "send stderr must report the store failure, got: {send_err}"
+    );
+    assert_eq!(rc_recv, 1, "recv must exit 1 when it cannot store the file");
+    assert!(!part.exists(), "no .part file may be left");
 }

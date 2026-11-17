@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use newnet::crypto::PeerRecord;
 use newnet::node::Node;
+use newnet::streams::{Frame, FRAME_STREAM};
 use newnet::udp::{UdpEndpoint, BURST, MAX_RECV_PER_POLL};
 
 fn pair_with_b_capacity(max_peers: usize) -> (UdpEndpoint, UdpEndpoint) {
@@ -196,4 +197,93 @@ fn sends_are_paced_by_time_not_by_poll_calls() {
         "one tick sent {} datagrams: more than a burst's worth twice",
         q0 - a.queued()
     );
+}
+
+// Two in-memory nodes, opened the way the outage tests do, for checks that
+// need no sockets at all.
+fn mem_pair() -> (Node, Node) {
+    let mut a = Node::new("alice", 0xA11CE);
+    let mut b = Node::new("bob", 0xB0B);
+    let rec_b = PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX };
+    let rec_a = PeerRecord { name: "alice".into(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX };
+    a.records.insert("bob".into(), rec_b);
+    b.records.insert("alice".into(), rec_a);
+    (a, b)
+}
+
+fn open_mem(a: &mut Node, b: &mut Node, eph: u8) -> u64 {
+    let (conn, hs1) = a.connect("bob", Some([eph; 32])).unwrap();
+    let hs2 = b.on_datagram(&hs1, 1);
+    assert_eq!(hs2.len(), 1, "responder answers: {:?}", b.stats);
+    let confirm = a.on_datagram(&hs2[0], 1);
+    assert_eq!(confirm.len(), 1, "initiator proves its keys with one packet");
+    let reply = b.on_datagram(&confirm[0], 1);
+    assert_eq!(reply.len(), 1, "responder answers the confirming PING");
+    assert!(a.on_datagram(&reply[0], 1).is_empty());
+    assert!(a.is_open(conn) && b.is_open(conn));
+    conn
+}
+
+#[test]
+fn a_far_ahead_stream_offset_is_refused() {
+    let (mut a, mut b) = mem_pair();
+    let conn = open_mem(&mut a, &mut b, 7);
+    let frame = Frame { ftype: FRAME_STREAM, id: 1, off: 1 << 40, cum: 0, sacks: vec![], data: vec![9] };
+    let dgram = a.send_frame(conn, &frame).expect("an open session seals the frame");
+    let replies = b.on_datagram(&dgram, 2);
+    assert!(replies.is_empty(), "a refused frame must come back with no datagram");
+    let s = &b.sessions[&conn];
+    assert_eq!(s.stat_overlimit, 1, "the refusal must be counted");
+    assert_eq!(s.rx_buffered(), 0, "a refused frame must buffer nothing");
+    assert!(!s.rx_streams.contains_key(&1), "a refused frame must create no state");
+}
+
+// One datagram the OS refuses to send must cost one send_errors and nothing
+// else: poll still returns Ok and the endpoint goes on.
+#[test]
+fn an_unsendable_destination_does_not_break_poll() {
+    let (mut a, _b) = pair_with_b_capacity(4096);
+    a.connect("bob", "255.255.255.255:9".parse().unwrap()).unwrap();
+    for _ in 0..10 {
+        assert!(a.poll().is_ok(), "poll must survive an unsendable destination");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if a.send_errors == 0 {
+        eprintln!("this platform allowed the send to 255.255.255.255:9, so nothing to count");
+    } else {
+        assert!(a.send_errors >= 1, "a refused send must be counted");
+        assert_eq!(a.queued(), 0, "the refused datagram must be dropped, not kept");
+    }
+}
+
+// A full outgoing queue drops datagrams and counts them; the stream timers
+// retransmit, so the whole transfer still crosses.
+#[test]
+fn a_full_outgoing_queue_drops_and_the_transfer_still_completes() {
+    let (mut a, mut b) = pair_with_b_capacity(4096);
+    let conn = a.connect("bob", b.local_addr()).unwrap();
+    pump(&mut a, &mut b, |a, b| a.node.is_open(conn) && b.node.is_open(conn), 10);
+
+    a.set_max_out(10);
+    let data: Vec<u8> = (0..300_000u64).map(|i| (i.wrapping_mul(31).wrapping_add(i / 1000)) as u8).collect();
+    a.send_bytes(conn, 1, &data);
+    assert_eq!(a.queued(), 10, "the outgoing queue must stop at max_out");
+    assert!(a.dropped_out > 0, "a full queue must count its drops");
+
+    let start = Instant::now();
+    let mut got: Vec<u8> = Vec::new();
+    while got.len() < data.len() {
+        let ra = a.poll().unwrap();
+        let rb = b.poll().unwrap();
+        got.extend(b.node.take_stream_bytes(conn, 1));
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "only {} of 300000 bytes crossed in 60 s",
+            got.len()
+        );
+        if ra == 0 && rb == 0 && a.queued() == 0 && b.queued() == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(got, data, "every byte must cross byte-exact");
 }
