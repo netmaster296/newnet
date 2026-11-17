@@ -160,7 +160,7 @@ impl UdpEndpoint {
                     received += 1;
                     let now = self.now();
                     let id = self.addr_id(src);
-                    let outs = self.node.on_datagram_from(id, &buf[..n], now);
+                    let outs = self.node.on_datagram_src(id, &crate::cookie::src_key_from_socket(&src), &buf[..n], now);
                     for dgram in outs {
                         self.queue_to(id, dgram);
                     }

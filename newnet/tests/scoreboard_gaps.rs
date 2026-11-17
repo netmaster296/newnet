@@ -147,6 +147,13 @@ fn hs_packet(ptype: u8, conn: u64, body: &[u8]) -> Vec<u8> {
     wire::encode(&wire::Header { version: wire::VERSION, ptype, conn_id: conn, seq: 0, len: body.len() as u16 }, body)
 }
 
+// v2 HANDSHAKE1: 16 zero cookie bytes in front of the Noise message.
+fn hs1_zero_cookie(conn: u64, noise: &[u8]) -> Vec<u8> {
+    let mut body = vec![0u8; wire::COOKIE_LEN];
+    body.extend_from_slice(noise);
+    hs_packet(wire::TYPE_HANDSHAKE1, conn, &body)
+}
+
 fn initiator_session(conn: u64, k1: [u8; 32], k2: [u8; 32]) -> Session {
     Session::from_split(conn, &SplitKeys { a_to_b_gen0: k1, b_to_a_gen0: k2, transcript_hash: [0u8; 32] }, true)
 }
@@ -339,7 +346,7 @@ fn an_independent_noise_ik_initiator_interoperates() {
     let e = StaticSecret::from([0x21u8; 32]);
     let conn = 0x1111u64;
     let (m1, st) = mini::msg1(&noise_ik::prologue(conn), &sb_pub, &public(&e), &sa_pub, &dh(&e, &sb_pub), &dh(&sa, &sb_pub), &hello(1));
-    let out = b.on_datagram(&hs_packet(wire::TYPE_HANDSHAKE1, conn, &m1), 1);
+    let out = b.on_datagram(&hs1_zero_cookie(conn, &m1), 1);
     assert_eq!(out.len(), 1, "Bob answers a spec-built message 1: {:?}", b.stats);
     let m2 = wire::decode(&out[0]).unwrap().body;
     let re: [u8; 32] = m2[..32].try_into().unwrap();
@@ -362,7 +369,7 @@ fn bobs_static_key_alone_must_not_let_anyone_be_alice() {
     let e = StaticSecret::from([0x66u8; 32]);
     let conn = 0x4D41u64;
     let (m1, st) = mini::msg1(&noise_ik::prologue(conn), &sb_pub, &public(&e), &sa_pub, &dh(&e, &sb_pub), &dh(&sb, &sa_pub), &hello(1));
-    let out = b.on_datagram(&hs_packet(wire::TYPE_HANDSHAKE1, conn, &m1), 1);
+    let out = b.on_datagram(&hs1_zero_cookie(conn, &m1), 1);
     assert_eq!(out.len(), 1, "forged message 1 is expected to be answered: {:?}", b.stats);
     let m2 = wire::decode(&out[0]).unwrap().body;
     let re: [u8; 32] = m2[..32].try_into().unwrap();
@@ -392,7 +399,7 @@ fn both_static_keys_do_not_open_a_recorded_session() {
 
     // The honest session, recorded.
     let (m1, st) = mini::msg1(&prologue, &sb_pub, &e_pub, &sa_pub, &dh(&e, &sb_pub), &dh(&sa, &sb_pub), &hello(1));
-    let out = b.on_datagram(&hs_packet(wire::TYPE_HANDSHAKE1, conn, &m1), 1);
+    let out = b.on_datagram(&hs1_zero_cookie(conn, &m1), 1);
     let m2 = wire::decode(&out[0]).unwrap().body;
     let re: [u8; 32] = m2[..32].try_into().unwrap();
     let (ok, k1, k2) = mini::finish(st, &m2, &dh(&e, &re), &dh(&sa, &re));

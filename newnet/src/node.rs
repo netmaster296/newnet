@@ -8,6 +8,7 @@ use ed25519_dalek::VerifyingKey;
 use rand::RngCore;
 
 use crate::content::{self, Msg, Reader};
+use crate::cookie::{self, CookieKeys, SrcKey};
 use crate::crypto::{self, PeerRecord};
 use crate::identity::{Identity, PinStore};
 use crate::link::{Addr, ADDR_ANY};
@@ -25,6 +26,11 @@ pub const HALF_OPEN_TTL: u64 = 400;
 pub const MAX_HALF_OPEN: usize = 64;
 pub const HS_RESENDS: u32 = 3;
 pub const HS_ATTEMPTS: u32 = 3;
+
+// One attempt accepts at most this many COOKIE datagrams (spec 4.5): enough
+// for the round and one lost-and-reforged retry, not enough for a flood to
+// pin the attempt to a fresh cookie forever.
+pub const COOKIE_ACCEPT_MAX: u8 = 2;
 
 // Ceiling on all handshake DH work in one budget epoch, whatever the
 // source split.
@@ -58,11 +64,18 @@ pub struct NodeStats {
     pub half_open_dropped_full: u64,
     pub sessions_dead: u64,
     pub sessions_idle_dropped: u64,
+    pub cookies_sent: u64,
+    pub cookies_received: u64,
+    pub hs1_bad_size: u64,
 }
 
 struct PendingInit {
     hs: InitiatorHandshake,
     datagram: Vec<u8>,
+    // Noise message 1 without the cookie prefix: what a COOKIE reply rebuilds
+    // the HANDSHAKE1 around, and what the half-open entry later compares.
+    noise: Vec<u8>,
+    cookies_accepted: u8,
     peer: String,
     sent: u64,
     resends: u32,
@@ -71,7 +84,9 @@ struct PendingInit {
 }
 
 struct HalfOpen {
-    msg1: Vec<u8>,
+    // Noise bytes of the accepted message 1 only (not the cookie): a replay
+    // of the same Noise under the same conn gets the stored HS2 back.
+    noise: Vec<u8>,
     msg2: Vec<u8>,
     keys: crypto::SplitKeys,
     created: u64,
@@ -99,6 +114,10 @@ pub struct Node {
     // Greatest tick this node has acted at (datagram in or tick_sessions).
     // connect() starts an attempt here, not at the budget-window start.
     last_tick: u64,
+    // Responder cookie secrets (rotation at the top of every HANDSHAKE1).
+    cookies: CookieKeys,
+    // Step 4a switch: false = treat every HANDSHAKE1 cookie as valid.
+    require_cookie: bool,
 }
 
 impl Node {
@@ -121,7 +140,21 @@ impl Node {
             budget_by_source: HashMap::new(),
             budget_total: 0,
             last_tick: 0,
+            cookies: CookieKeys::new(0),
+            require_cookie: false,
         }
+    }
+
+    // Step 4a switch. False (the default until 4b): the responder treats
+    // every HANDSHAKE1 as if its cookie were valid. The initiator side of
+    // the COOKIE datagram is always live.
+    pub fn set_require_cookie(&mut self, on: bool) {
+        self.require_cookie = on;
+    }
+
+    // Fixed cookie secret for tests; also the published-vector hook.
+    pub fn set_cookie_secret_for_test(&mut self, secret: [u8; 32], now: u64) {
+        self.cookies = CookieKeys::from_secret_for_test(secret, now);
     }
 
     pub fn lookup_name(&self, name: &str) -> Option<PeerRecord> {
@@ -199,13 +232,17 @@ impl Node {
         let stamp = self.next_stamp;
         let mut hs = InitiatorHandshake::new(&self.ident.x_static.to_bytes(), rec.x.as_bytes(), &noise_ik::prologue(conn), eph)
             .map_err(|_| ConnectError::NoRecord)?;
-        let body = hs.write_msg1(&noise_ik::encode_hello(&Hello { stamp, name: self.name.clone() }))
+        let noise = hs.write_msg1(&noise_ik::encode_hello(&Hello { stamp, name: self.name.clone() }))
             .map_err(|_| ConnectError::NoRecord)?;
+        // v2 body layout: 16 zero cookie bytes, then the Noise message.
+        let mut body = Vec::with_capacity(wire::COOKIE_LEN + noise.len());
+        body.extend_from_slice(&[0u8; wire::COOKIE_LEN]);
+        body.extend_from_slice(&noise);
         let datagram = wire::encode(
             &wire::Header { version: wire::VERSION, ptype: wire::TYPE_HANDSHAKE1, conn_id: conn, seq: 0, len: body.len() as u16 },
             &body,
         );
-        self.pending_init.insert(conn, PendingInit { hs, datagram: datagram.clone(), peer: name.to_string(), sent: tick, resends: 0, attempt, to });
+        self.pending_init.insert(conn, PendingInit { hs, datagram: datagram.clone(), noise, cookies_accepted: 0, peer: name.to_string(), sent: tick, resends: 0, attempt, to });
         Ok((conn, datagram))
     }
 
@@ -224,8 +261,16 @@ impl Node {
     }
 
     // One hub datagram in, datagrams to send back out. Every datagram
-    // returned is a reply to `from`. Never panics.
+    // returned is a reply to `from`. Never panics. The hub's source id
+    // becomes the lab source key, so the in-memory lab does the cookie
+    // round too.
     pub fn on_datagram_from(&mut self, from: Addr, bytes: &[u8], tick: u64) -> Vec<Vec<u8>> {
+        self.on_datagram_src(from, &cookie::src_key_lab(from), bytes, tick)
+    }
+
+    // Same, with the real claimed source of the datagram: what a UDP
+    // endpoint passes (src_key_from_socket), the hub what it can derive.
+    pub fn on_datagram_src(&mut self, from: Addr, src: &SrcKey, bytes: &[u8], tick: u64) -> Vec<Vec<u8>> {
         self.last_tick = tick;
         let pkt = match wire::decode(bytes) {
             Ok(p) => p,
@@ -239,32 +284,56 @@ impl Node {
             }
         };
         match pkt.header.ptype {
-            wire::TYPE_HANDSHAKE1 => self.on_hs1(pkt, bytes, tick, from),
+            wire::TYPE_HANDSHAKE1 => self.on_hs1(pkt, bytes, src, tick, from),
             wire::TYPE_HANDSHAKE2 => self.on_hs2(pkt, tick, from),
             wire::TYPE_DATA => self.on_data(pkt, tick, from),
+            wire::TYPE_COOKIE => self.on_cookie(pkt, tick, from),
             _ => vec![],
         }
     }
 
-    fn on_hs1(&mut self, pkt: wire::Packet, bytes: &[u8], tick: u64, from: Addr) -> Vec<Vec<u8>> {
+    fn on_hs1(&mut self, pkt: wire::Packet, bytes: &[u8], src: &SrcKey, tick: u64, from: Addr) -> Vec<Vec<u8>> {
         let conn = pkt.header.conn_id;
+        // 2. Size before anything else: a HANDSHAKE1 is 147..=210 bytes on
+        // the wire (spec 2.2); junk outside the range costs no cookie work.
+        if bytes.len() < wire::HS1_MIN_DATAGRAM || bytes.len() > wire::HS1_MAX_DATAGRAM {
+            self.stats.hs1_bad_size += 1;
+            return vec![];
+        }
+        // 3. Cookie (spec 4.4): one HMAC, no table, no DH. A bad or absent
+        // cookie is answered with a 40-byte COOKIE, nothing else.
+        self.cookies.rotate_if_due(tick);
+        if self.require_cookie {
+            let mut want = [0u8; cookie::COOKIE_LEN];
+            want.copy_from_slice(&pkt.body[..cookie::COOKIE_LEN]);
+            if !self.cookies.check(src, conn, &want) {
+                let made = self.cookies.make(src, conn);
+                self.stats.cookies_sent += 1;
+                return vec![wire::encode(
+                    &wire::Header { version: wire::VERSION, ptype: wire::TYPE_COOKIE, conn_id: conn, seq: 0, len: cookie::COOKIE_LEN as u16 },
+                    &made,
+                )];
+            }
+        }
         // A live conn is never reset by a replayed HS1.
         if self.sessions.contains_key(&conn) {
             self.stats.auth_fails += 1;
             return vec![];
         }
-        // Half-open: the identical HS1 gets the stored HS2 back, free of
-        // charge. Anything else on this conn is refused.
+        // 5. Half-open: the same Noise bytes under this conn get the stored
+        // HS2 back, free of charge. Anything else on this conn is refused.
         if let Some(half) = self.half_open.get(&conn) {
-            if half.msg1 == bytes {
+            if half.noise == pkt.body[cookie::COOKIE_LEN..] {
                 self.stats.hs2_resent += 1;
                 return vec![half.msg2.clone()];
             }
             self.stats.auth_fails += 1;
             return vec![];
         }
-        // Budgets run in epochs of BUDGET_EPOCH_TICKS ticks, so 1 ms ticks
-        // keep the v1 per-20 ms rate.
+        // 6. Budget, charged only now (after the cookie): what makes the
+        // per-source budget meaningful on UDP (spec 4.7). Budgets run in
+        // epochs of BUDGET_EPOCH_TICKS ticks, so 1 ms ticks keep the v1
+        // per-20 ms rate.
         let epoch = tick / BUDGET_EPOCH_TICKS;
         if self.budget_epoch != epoch {
             self.budget_epoch = epoch;
@@ -288,7 +357,7 @@ impl Node {
                 return vec![];
             }
         };
-        let (payload, remote_static) = match hs.read_msg1(&pkt.body) {
+        let (payload, remote_static) = match hs.read_msg1(&pkt.body[cookie::COOKIE_LEN..]) {
             Ok(v) => v,
             Err(_) => {
                 self.stats.auth_fails += 1;
@@ -337,8 +406,42 @@ impl Node {
             &wire::Header { version: wire::VERSION, ptype: wire::TYPE_HANDSHAKE2, conn_id: conn, seq: 0, len: msg2.len() as u16 },
             &msg2,
         );
-        self.half_open.insert(conn, HalfOpen { msg1: bytes.to_vec(), msg2: datagram2.clone(), keys, created: tick, from, peer: hello.name.clone() });
+        self.half_open.insert(conn, HalfOpen { noise: pkt.body[cookie::COOKIE_LEN..].to_vec(), msg2: datagram2.clone(), keys, created: tick, from, peer: hello.name.clone() });
         vec![datagram2]
+    }
+
+    // Initiator side of the cookie round (spec 4.5): a COOKIE rebuilds the
+    // attempt's datagram around the fresh cookie. Accepted only for a live
+    // pending attempt, with a 16-byte body, from the address the attempt
+    // was sent to (when known), and at most COOKIE_ACCEPT_MAX times per
+    // attempt.
+    fn on_cookie(&mut self, pkt: wire::Packet, tick: u64, from: Addr) -> Vec<Vec<u8>> {
+        self.stats.cookies_received += 1;
+        let conn = pkt.header.conn_id;
+        let p = match self.pending_init.get_mut(&conn) {
+            Some(p) => p,
+            None => return vec![],
+        };
+        if pkt.body.len() != cookie::COOKIE_LEN {
+            return vec![];
+        }
+        if p.to != ADDR_ANY && from != p.to {
+            return vec![];
+        }
+        if p.cookies_accepted >= COOKIE_ACCEPT_MAX {
+            return vec![];
+        }
+        p.cookies_accepted += 1;
+        let mut body = Vec::with_capacity(cookie::COOKIE_LEN + p.noise.len());
+        body.extend_from_slice(&pkt.body);
+        body.extend_from_slice(&p.noise);
+        let dgram = wire::encode(
+            &wire::Header { version: wire::VERSION, ptype: wire::TYPE_HANDSHAKE1, conn_id: conn, seq: 0, len: body.len() as u16 },
+            &body,
+        );
+        p.datagram = dgram.clone();
+        p.sent = tick; // the resend timer now guards the cookie-bearing copy
+        vec![dgram]
     }
 
     fn on_hs2(&mut self, pkt: wire::Packet, tick: u64, from: Addr) -> Vec<Vec<u8>> {
