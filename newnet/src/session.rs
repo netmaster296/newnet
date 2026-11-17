@@ -140,6 +140,8 @@ pub struct Session {
     // Where the peer is now: learned from authenticated packets, then
     // followed when the peer roams.
     pub peer_addr: crate::link::Addr,
+    // The name the peer claimed in its Hello, recorded at the handshake.
+    pub peer_name: String,
     pub state: State,
     pub is_initiator: bool,
     tx: KeyChain,
@@ -182,6 +184,7 @@ impl Session {
         Session {
             conn_id,
             peer_addr: crate::link::ADDR_ANY,
+            peer_name: String::new(),
             state: State::Open,
             is_initiator,
             tx: KeyChain::new(txk),

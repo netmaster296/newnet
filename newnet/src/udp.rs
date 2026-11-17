@@ -13,6 +13,7 @@ use crate::node::{ConnectError, Node};
 
 pub const TICK_MS: u64 = 20;
 pub const TIMEOUT_TICKS: u64 = 25;
+// Datagrams one poll may send per tick.
 pub const BURST: usize = 32;
 pub const MAX_PEERS: usize = 4096;
 // A flood must not starve the timers or the send step: one poll drains at
@@ -28,6 +29,8 @@ pub struct UdpEndpoint {
     max_peers: usize,
     evict_next: usize,
     out: VecDeque<(SocketAddr, Vec<u8>)>,
+    send_tick: u64,
+    sent_this_tick: usize,
 }
 
 impl UdpEndpoint {
@@ -49,6 +52,8 @@ impl UdpEndpoint {
             max_peers,
             evict_next: 0,
             out: VecDeque::new(),
+            send_tick: 0,
+            sent_this_tick: 0,
         })
     }
 
@@ -153,10 +158,17 @@ impl UdpEndpoint {
             self.queue_to(to, dgram);
         }
 
-        for _ in 0..BURST {
+        // Sends are paced by time, not by how often poll is called: at most
+        // BURST datagrams go out per tick, however many polls fall inside it.
+        let now = self.now();
+        if now != self.send_tick {
+            self.send_tick = now;
+            self.sent_this_tick = 0;
+        }
+        while self.sent_this_tick < BURST {
             let Some((sa, dgram)) = self.out.pop_front() else { break };
             match self.socket.send_to(&dgram, sa) {
-                Ok(_) => {}
+                Ok(_) => self.sent_this_tick += 1,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     self.out.push_front((sa, dgram));
                     break;
@@ -169,6 +181,15 @@ impl UdpEndpoint {
 
     pub fn queued(&self) -> usize {
         self.out.len()
+    }
+
+    // The socket address stored in this peer slot; None for ADDR_ANY or an
+    // out-of-range slot.
+    pub fn peer_socket(&self, addr: Addr) -> Option<SocketAddr> {
+        if addr == ADDR_ANY {
+            return None;
+        }
+        self.peers.get(addr as usize).copied()
     }
 
     // Send CLOSE to wherever this conn is addressed and free local state.

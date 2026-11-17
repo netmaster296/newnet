@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use newnet::crypto::PeerRecord;
 use newnet::node::Node;
-use newnet::udp::{UdpEndpoint, MAX_RECV_PER_POLL};
+use newnet::udp::{UdpEndpoint, BURST, MAX_RECV_PER_POLL};
 
 fn pair_with_b_capacity(max_peers: usize) -> (UdpEndpoint, UdpEndpoint) {
     let mut a = Node::new("alice", 0xA11CE);
@@ -95,16 +95,37 @@ fn addresses_in_use_are_never_evicted() {
     let conn = ea.connect("bob", eb.local_addr()).unwrap();
     pump(&mut ea, &mut eb, |a, b| a.node.is_open(conn) && b.node.is_open(conn), 10);
 
-    for i in 0..3u8 {
-        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
-        s.send_to(&[b'y', i, 0x33, i << 2, 9], eb.local_addr()).unwrap();
+    let alice_addr = ea.local_addr();
+    let slot = eb.node.addr_of(conn);
+    assert_eq!(eb.peer_socket(slot), Some(alice_addr));
+
+    // Three other sources send junk while alice stays silent. Alice is NOT polled here.
+    let junk: Vec<UdpSocket> = (0..3)
+        .map(|_| {
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.set_nonblocking(true).unwrap();
+            s
+        })
+        .collect();
+    for s in &junk {
+        s.send_to(b"junk junk junk", eb.local_addr()).unwrap();
     }
-    for _ in 0..5 {
-        ea.poll().unwrap();
+    for _ in 0..50 {
         eb.poll().unwrap();
         std::thread::sleep(Duration::from_millis(1));
     }
 
+    // One slot, and it belongs to a live session: it must not have moved.
+    assert_eq!(eb.peer_count(), 1);
+    assert_eq!(eb.peer_socket(slot), Some(alice_addr), "the session's address was given away");
+    assert_eq!(eb.node.addr_of(conn), slot);
+    let mut scratch = [0u8; 64];
+    for s in &junk {
+        assert!(s.recv_from(&mut scratch).is_err(), "b answered a junk source");
+    }
+
+    // And the session still carries data: alice sends 100,000 bytes on
+    // stream 1, b receives them byte-exact within 20 s.
     let data: Vec<u8> = (0..100_000u64).map(|i| (i.wrapping_mul(31).wrapping_add(i / 1000)) as u8).collect();
     ea.send_bytes(conn, 1, &data);
 
@@ -120,4 +141,26 @@ fn addresses_in_use_are_never_evicted() {
         }
     }
     assert_eq!(got, data);
+}
+
+#[test]
+fn sends_are_paced_by_time_not_by_poll_calls() {
+    let (mut a, mut b) = pair_with_b_capacity(4096);
+    let conn = a.connect("bob", b.local_addr()).unwrap();
+    pump(&mut a, &mut b, |a, b| a.node.is_open(conn) && b.node.is_open(conn), 10);
+
+    let data: Vec<u8> = (0..400_000u64).map(|i| (i.wrapping_mul(31).wrapping_add(i / 1000)) as u8).collect();
+    a.send_bytes(conn, 1, &data);
+
+    let q0 = a.queued();
+    let t0 = a.now();
+    // Tight loop inside one tick: b is never polled, nothing sleeps.
+    while a.now() == t0 {
+        a.poll().unwrap();
+    }
+    assert!(
+        q0 - a.queued() <= 2 * BURST,
+        "one tick sent {} datagrams: more than a burst's worth twice",
+        q0 - a.queued()
+    );
 }
