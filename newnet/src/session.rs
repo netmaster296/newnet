@@ -7,6 +7,10 @@ use crate::wire;
 
 pub const REPLAY_WINDOW: usize = 2048;
 
+// A quarter of REPLAY_WINDOW, so that new chunks, gap retransmits and timer
+// retransmits sealed in one pump round (at most 3 x 512) stay inside the window.
+pub const MAX_IN_FLIGHT: usize = 512;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum WindowOutcome {
     Fresh,
@@ -107,6 +111,11 @@ pub struct Session {
     pub transcript: [u8; 32],
     pub stat_badtag: u64,
     pub stat_replay: u64,
+    // Chunks waiting for their first transmission, in the order the
+    // application submitted them: (stream id, offset, chunk bytes).
+    send_queue: std::collections::VecDeque<(u32, u64, Vec<u8>)>,
+    // Always equals the sum of pending() over all tx_streams.
+    in_flight_total: usize,
 }
 
 impl Session {
@@ -131,7 +140,41 @@ impl Session {
             transcript: keys.transcript_hash,
             stat_badtag: 0,
             stat_replay: 0,
+            send_queue: std::collections::VecDeque::new(),
+            in_flight_total: 0,
         }
+    }
+
+    pub fn in_flight_total(&self) -> usize {
+        self.in_flight_total
+    }
+
+    pub fn queued_chunks(&self) -> usize {
+        self.send_queue.len()
+    }
+
+    // Release queued chunks up to the in-flight cap, arming each as it goes.
+    pub fn flush(&mut self, now: u64) -> Vec<Frame> {
+        let mut out = Vec::new();
+        while self.in_flight_total < MAX_IN_FLIGHT {
+            let Some((stream, off, chunk)) = self.send_queue.pop_front() else { break };
+            let f = self.tx_streams.entry(stream).or_default().start(stream, off, chunk, now);
+            self.in_flight_total += 1;
+            out.push(f);
+        }
+        out
+    }
+
+    // Split bytes into chunks, assign offsets now, queue for first
+    // transmission, and release whatever the cap still allows.
+    pub fn queue_stream_bytes(&mut self, stream: u32, bytes: &[u8], now: u64) -> Vec<Frame> {
+        for chunk in bytes.chunks(streams::CHUNK) {
+            let tx = self.tx_streams.entry(stream).or_default();
+            let off = tx.next_off;
+            tx.next_off += chunk.len() as u64;
+            self.send_queue.push_back((stream, off, chunk.to_vec()));
+        }
+        self.flush(now)
     }
 
     // Seal one inner frame into a full datagram. Header is AAD.
@@ -197,8 +240,13 @@ impl Session {
             }
             streams::FRAME_ACK => {
                 let tx = self.tx_streams.entry(f.id).or_default();
+                let before = tx.pending();
                 tx.on_ack(f.cum, &f.sacks);
-                Ok(tx.gap_retransmit(f.id, now))
+                let released = before - tx.pending();
+                let mut reply = tx.gap_retransmit(f.id, now);
+                self.in_flight_total -= released;
+                reply.extend(self.flush(now));
+                Ok(reply)
             }
             streams::FRAME_DGRAM => {
                 if self.dgram_in.len() < 10_000 {
@@ -221,6 +269,8 @@ impl Session {
         for id in ids {
             out.extend(self.tx_streams.get_mut(&id).unwrap().timeout(id, now, timeout));
         }
+        out.extend(self.flush(now));
+        debug_assert_eq!(self.in_flight_total, self.tx_streams.values().map(|t| t.pending()).sum::<usize>());
         out
     }
 }

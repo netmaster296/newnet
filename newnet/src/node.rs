@@ -384,7 +384,7 @@ impl Node {
             Some(s) => s,
             None => return vec![],
         };
-        let frames = s.tx_streams.entry(stream).or_default().send(stream, &content::put(m), 0);
+        let frames = s.queue_stream_bytes(stream, &content::put(m), 0);
         frames.iter().map(|f| s.seal_frame(f)).collect()
     }
 
@@ -394,7 +394,7 @@ impl Node {
             Some(s) => s,
             None => return vec![],
         };
-        let frames = s.tx_streams.entry(stream).or_default().send(stream, bytes, tick);
+        let frames = s.queue_stream_bytes(stream, bytes, tick);
         frames.iter().map(|f| s.seal_frame(f)).collect()
     }
 
