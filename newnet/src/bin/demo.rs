@@ -272,10 +272,11 @@ fn main() {
     println!("[8] video {sent_frames}/{sent_frames} frames delivered+hash-verified through 2% loss and reorder, {rounds} rounds drained (retransmits deduped by offsets; replays counted: {})", nodes[BOB].stats.data_replay);
     // ---- Attacks ----
     let before = nodes[BOB].stats.data_badtag;
-    // Sequence 0 so the packet reaches the AEAD check this step is about. A
+    // The packet uses the next sequence number so that it reaches the AEAD
+    // check this step is about. Sequence 0's key is already erased by now. A
     // far-future sequence number is refused earlier, before any key is
     // derived (tests/scoreboard_gaps.rs covers that case).
-    let spoof = attacks::spoof_data(bob_conn, 0, &seed32(0x77), b"i am alice");
+    let spoof = attacks::spoof_data(bob_conn, nodes[BOB].sessions[&bob_conn].rx_highest() + 1, &seed32(0x77), b"i am alice");
     hub.send(MALLORY, &spoof);
     pump(&mut hub, &mut nodes, 5);
     assert_eq!(nodes[BOB].stats.data_badtag, before + 1);

@@ -61,23 +61,43 @@ pub struct SplitKeys {
     pub transcript_hash: [u8; 32],
 }
 
-// Traffic key chain, one direction. gen = seq / 1000.
+// Traffic key chain, one direction. gen = seq / 1000. Old generations are
+// erased: the chain holds only generations >= base, so reading process
+// memory later does not hand over the generation-0 seed.
 pub struct KeyChain {
-    gens: Vec<[u8; 32]>,
+    base: u64,
+    gens: std::collections::VecDeque<[u8; 32]>,
 }
 
 impl KeyChain {
     pub fn new(gen0: [u8; 32]) -> Self {
-        KeyChain { gens: vec![gen0] }
+        KeyChain { base: 0, gens: std::collections::VecDeque::from([gen0]) }
     }
-    pub fn key_for(&mut self, gen: u64) -> [u8; 32] {
-        while (self.gens.len() as u64) <= gen {
-            let prev = *self.gens.last().unwrap();
-            self.gens.push(hkdf1(&prev, b"NEWNET-GEN"));
+    // Key for a generation, deriving forward as needed. None when the
+    // generation has been erased (gen < base). The key for generation g
+    // sits at index g - base.
+    pub fn key_for(&mut self, gen: u64) -> Option<[u8; 32]> {
+        if gen < self.base {
+            return None;
         }
-        self.gens[gen as usize]
+        while self.base + self.gens.len() as u64 <= gen {
+            let prev = *self.gens.back().unwrap();
+            self.gens.push_back(hkdf1(&prev, b"NEWNET-GEN"));
+        }
+        Some(self.gens[(gen - self.base) as usize])
     }
-    // How many generations have been derived so far.
+    // Erase every generation below `gen`, zeroing each key before dropping
+    // it. The newest key is never removed.
+    pub fn forget_before(&mut self, gen: u64) {
+        while self.base < gen && self.gens.len() > 1 {
+            if let Some(front) = self.gens.front_mut() {
+                front.fill(0);
+            }
+            self.gens.pop_front();
+            self.base += 1;
+        }
+    }
+    // How many keys are held now.
     pub fn generations(&self) -> usize {
         self.gens.len()
     }
@@ -112,11 +132,26 @@ mod tests {
     #[test]
     fn keychain_rotates_per_generation() {
         let mut kc = KeyChain::new([3u8; 32]);
-        let g0 = kc.key_for(0);
-        let g1 = kc.key_for(1);
-        let g2 = kc.key_for(2);
+        let g0 = kc.key_for(0).unwrap();
+        let g1 = kc.key_for(1).unwrap();
+        let g2 = kc.key_for(2).unwrap();
         assert_ne!(g0, g1);
         assert_ne!(g1, g2);
-        assert_eq!(kc.key_for(0), g0); // chain is append-only
+        assert_eq!(kc.key_for(0).unwrap(), g0); // chain is append-only
+    }
+
+    #[test]
+    fn keychain_forgets_old_generations() {
+        let mut kc = KeyChain::new([3u8; 32]);
+        let g2 = kc.key_for(3).unwrap();
+        let g2k = kc.key_for(2).unwrap();
+        kc.forget_before(2);
+        assert_eq!(kc.key_for(1), None);
+        assert_eq!(kc.key_for(2).unwrap(), g2k);
+        assert_eq!(kc.key_for(3).unwrap(), g2);
+        let g5 = kc.key_for(5).unwrap();
+        kc.forget_before(100);
+        assert_eq!(kc.generations(), 1);
+        assert_eq!(kc.key_for(5).unwrap(), g5);
     }
 }

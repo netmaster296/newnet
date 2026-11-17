@@ -46,6 +46,11 @@ impl Default for ReplayWindow {
 }
 
 impl ReplayWindow {
+    // Highest authenticated sequence number seen.
+    pub fn highest(&self) -> u64 {
+        self.highest
+    }
+
     // True when the seq is beyond MAX_LOOKAHEAD of the highest authenticated
     // seq. Needs no key, so it can run before a packet is authenticated.
     pub fn too_far(&self, seq: u64) -> bool {
@@ -211,7 +216,8 @@ impl Session {
         let seq = self.tx_seq;
         self.tx_seq += 1;
         let gen = seq / crypto::KEY_ROTATION_INTERVAL;
-        let key = self.tx.key_for(gen);
+        let key = self.tx.key_for(gen).expect("the current send generation is always held");
+        self.tx.forget_before(gen);
         let hdr = wire::Header {
             version: wire::VERSION,
             ptype: wire::TYPE_DATA,
@@ -224,9 +230,19 @@ impl Session {
         wire::encode(&hdr, &ct)
     }
 
-    // Receive-side key generations derived so far.
+    // Receive-side keys held now (older generations are erased).
     pub fn rx_generations(&self) -> usize {
         self.rx.generations()
+    }
+
+    // Highest authenticated sequence number this side has opened.
+    pub fn rx_highest(&self) -> u64 {
+        self.window.highest()
+    }
+
+    // Send-side keys held now: only the current generation.
+    pub fn tx_generations(&self) -> usize {
+        self.tx.generations()
     }
 
     // Open a DATA packet: AEAD first, then replay window. Returns plaintext.
@@ -245,7 +261,15 @@ impl Session {
             return Err(SessionError::Replay(WindowOutcome::TooFar));
         }
         let gen = seq / crypto::KEY_ROTATION_INTERVAL;
-        let key = self.rx.key_for(gen);
+        // A packet whose key was erased is older than the window: its key is
+        // gone, so it cannot be authenticated and is refused as too old.
+        let key = match self.rx.key_for(gen) {
+            Some(k) => k,
+            None => {
+                self.stat_replay += 1;
+                return Err(SessionError::Replay(WindowOutcome::TooOld));
+            }
+        };
         let hbytes = pkt.header_bytes();
         let pt = crypto::open(&key, seq, &hbytes, &pkt.body)
             .map_err(|_| {
@@ -255,6 +279,11 @@ impl Session {
         match self.window.check(seq) {
             WindowOutcome::Fresh => {
                 self.confirmed = true;
+                // Only an authenticated packet erases keys. Erase everything
+                // below the window: a later packet inside the window still
+                // finds its key, one below it is TooOld either way.
+                let low = self.window.highest().saturating_sub(REPLAY_WINDOW as u64 - 1);
+                self.rx.forget_before(low / crypto::KEY_ROTATION_INTERVAL);
                 Ok(pt)
             }
             other => {
