@@ -262,6 +262,40 @@ fn lost_hs2_is_healed_by_resending_the_same_datagram() {
     assert_eq!(b.sessions.len(), 1);
 }
 
+// The traffic key for a packet is derived from its sequence number, which
+// sits in the cleartext header. One forged header must not make the receiver
+// derive keys: with seq = u64::MAX the old code derived generations until
+// the process ran out of memory.
+#[test]
+fn a_forged_far_future_sequence_number_derives_no_keys() {
+    let (mut a, mut b) = pair();
+    let (conn, _) = open(&mut a, &mut b, 10);
+    let before = b.sessions[&conn].rx_generations();
+    // Three billion first: three million generations if the guard is missing,
+    // which shows the fault without exhausting memory. Only then the real one.
+    b.on_datagram(&newnet::attacks::spoof_data(conn, 3_000_000_000, &[1u8; 32], b"x"), 2);
+    assert_eq!(b.sessions[&conn].rx_generations(), before, "a forged header drove key derivation");
+    b.on_datagram(&newnet::attacks::spoof_data(conn, u64::MAX, &[1u8; 32], b"x"), 2);
+    assert_eq!(b.sessions[&conn].rx_generations(), before);
+    // The session is unharmed.
+    for p in a.send_bytes(conn, 1, b"still here", 2) {
+        b.on_datagram(&p, 2);
+    }
+    assert_eq!(b.take_stream_bytes(conn, 1), b"still here".to_vec());
+
+    // Same forged packet against a handshake that is only half open.
+    let (mut a, mut b) = pair();
+    let (conn, hs1) = a.connect("bob", Some([11u8; 32])).unwrap();
+    let hs2 = b.on_datagram(&hs1, 1);
+    b.on_datagram(&newnet::attacks::spoof_data(conn, 3_000_000_000, &[1u8; 32], b"x"), 1);
+    b.on_datagram(&newnet::attacks::spoof_data(conn, u64::MAX, &[1u8; 32], b"x"), 1);
+    assert_eq!(b.half_open_count(), 1);
+    for confirm in a.on_datagram(&hs2[0], 1) {
+        b.on_datagram(&confirm, 1);
+    }
+    assert!(b.is_open(conn));
+}
+
 #[test]
 fn a_forged_hs2_does_not_kill_a_pending_handshake() {
     let (mut a, mut b) = pair();

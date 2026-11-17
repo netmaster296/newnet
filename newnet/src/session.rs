@@ -32,6 +32,12 @@ impl Default for ReplayWindow {
 }
 
 impl ReplayWindow {
+    // True when `check` would answer TooFar. Needs no key, so it can run
+    // before a packet is authenticated.
+    pub fn too_far(&self, seq: u64) -> bool {
+        seq > self.highest && seq - self.highest >= REPLAY_WINDOW as u64
+    }
+
     pub fn check(&mut self, seq: u64) -> WindowOutcome {
         if seq > self.highest {
             let d = seq - self.highest;
@@ -153,12 +159,26 @@ impl Session {
         wire::encode(&hdr, &ct)
     }
 
+    // Receive-side key generations derived so far.
+    pub fn rx_generations(&self) -> usize {
+        self.rx.generations()
+    }
+
     // Open a DATA packet: AEAD first, then replay window. Returns plaintext.
     pub fn open_data(&mut self, pkt: &wire::Packet) -> Result<Vec<u8>, SessionError> {
         if self.state != State::Open {
             return Err(SessionError::NotOpen);
         }
         let seq = pkt.header.seq;
+        // The traffic key is derived from the sequence number, and the header
+        // is not authenticated yet. A sequence number the window would refuse
+        // anyway is refused here, before any key is derived. Without this,
+        // one forged header with a huge seq made the receiver derive key
+        // generations until it ran out of memory.
+        if self.window.too_far(seq) {
+            self.stat_replay += 1;
+            return Err(SessionError::Replay(WindowOutcome::TooFar));
+        }
         let gen = seq / crypto::KEY_ROTATION_INTERVAL;
         let key = self.rx.key_for(gen);
         let hbytes = pkt.header_bytes();

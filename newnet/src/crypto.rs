@@ -77,6 +77,10 @@ impl KeyChain {
         }
         self.gens[gen as usize]
     }
+    // How many generations have been derived so far.
+    pub fn generations(&self) -> usize {
+        self.gens.len()
+    }
 }
 
 pub struct PeerRecord {
