@@ -19,6 +19,17 @@ A4. Step 1. Only tick numbers change. Every assertion stays. A test loop that wa
 
 A5. Every step. The implementer runs each mutation the step names, sees the named test fail, restores the code, and records the result in `qwen-run/v2/<step>.mutations.md`. A second, separate run then repeats the mutations as a check.
 
+A6. Fixes found when the phase 1 chain was checked. Do both as one step, after step 7.
+  (a) Gap retransmits are limited in ticks, and step 1 changed a tick from 20 ms to 1 ms without changing that limit. On a real endpoint a missing chunk is now re-sent up to once per millisecond instead of once per 20 ms, and with a slow receiver that floods the queue. Measured with debug binaries, 5 MB over loopback, three runs: 12.0 s, a timeout at 90 s, 3.3 s. With the limit at 20 ticks: 5.6 s, 4.1 s, 3.5 s.
+      - `src/streams.rs`: add `pub fn gap_retransmit_spaced(&mut self, id: u32, now: u64, interval: u64) -> Vec<Frame>`: the body of today's `gap_retransmit`, except that a chunk is re-sent only when `now >= sent + interval`. `gap_retransmit(id, now)` stays, with its signature, and calls `gap_retransmit_spaced(id, now, 1)`.
+      - `src/session.rs`: `Session` gets a private `gap_interval: u64`, 1 in `from_split`; `pub fn set_gap_interval(&mut self, ticks: u64)` and `pub fn gap_interval(&self) -> u64`. The ACK branch of `on_frame` calls `gap_retransmit_spaced(.., self.gap_interval)`.
+      - `src/node.rs`: `Node` gets a private `gap_interval: u64`, 1 in every constructor; `pub fn set_gap_interval(&mut self, ticks: u64)` (stores it and applies it to every existing session) and `pub fn gap_interval(&self) -> u64`. Every place that creates a `Session` calls `set_gap_interval(self.gap_interval)` on it.
+      - `src/udp.rs`: `pub const GAP_INTERVAL_TICKS: u64 = 20;` and `bind_with_capacity` calls `node.set_gap_interval(GAP_INTERVAL_TICKS)`. The in-memory lab keeps 1, because there a tick is one pump round.
+      - Tests: in `src/streams.rs`, `gap_interval_spaces_retransmits`: with interval 20, a chunk gap-retransmitted at tick 100 is not re-sent by calls at ticks 101 to 119 and is re-sent at tick 120; with interval 1 a call at tick 101 re-sends it. In `tests/retime.rs`, `the_udp_endpoint_spaces_gap_retransmits_by_twenty_ms`: bind an endpoint on 127.0.0.1:0 and assert `ep.node.gap_interval() * TICK_MS == 20`; and `a_lab_node_keeps_the_one_tick_interval`: `Node::new("x", 1).gap_interval() == 1`.
+      - Mutations: do not call `set_gap_interval` in `bind_with_capacity` (the endpoint test fails); compare with `now > sent` in `gap_retransmit_spaced` (the streams test fails).
+      - Acceptance: `cargo test --test keys_cli` passes FIVE times in a row and each run takes under 90 seconds. Record the five times.
+  (b) In `Node::on_hs2` the pending attempt is removed before the session-room check, so when the node already holds `MAX_SESSIONS` sessions the attempt is consumed instead of the packet being dropped. Check for room first. When there is none: count `sessions_refused_full`, leave the pending attempt in place, return nothing. Test in `tests/responder_limits.rs`, `a_full_initiator_keeps_its_pending_attempt`: a node holding `MAX_SESSIONS` sessions that receives a valid HANDSHAKE2 for a pending attempt still has `pending_count()` unchanged and `sessions_refused_full` one higher. Mutation: restore the old order; the test fails.
+
 ---
 
 
