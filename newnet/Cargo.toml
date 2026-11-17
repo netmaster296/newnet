@@ -2,6 +2,9 @@
 name = "newnet"
 version = "0.1.0"
 edition = "2021"
+description = "Identity-first secure session layer: a proof of concept. Not audited; do not rely on it for security."
+license = "GPL-3.0-only"
+repository = "https://github.com/netmaster296/newnet"
 
 [dependencies]
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
