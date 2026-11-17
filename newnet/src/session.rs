@@ -7,6 +7,12 @@ use crate::wire;
 
 pub const REPLAY_WINDOW: usize = 2048;
 
+// How far ahead of the highest authenticated sequence number a header may
+// claim to be before it is refused without deriving a key. It bounds what a
+// forged header can cost (about a thousand key generations, once) and how
+// long an outage the session survives.
+pub const MAX_LOOKAHEAD: u64 = 1 << 20;
+
 // Pings a new initiator sends before the peer confirms, after which the
 // session is dropped as dead.
 pub const PING_RESENDS: u32 = 5;
@@ -40,19 +46,23 @@ impl Default for ReplayWindow {
 }
 
 impl ReplayWindow {
-    // True when `check` would answer TooFar. Needs no key, so it can run
-    // before a packet is authenticated.
+    // True when the seq is beyond MAX_LOOKAHEAD of the highest authenticated
+    // seq. Needs no key, so it can run before a packet is authenticated.
     pub fn too_far(&self, seq: u64) -> bool {
-        seq > self.highest && seq - self.highest >= REPLAY_WINDOW as u64
+        seq > self.highest && seq - self.highest >= MAX_LOOKAHEAD
     }
 
+    // An authenticated seq above `highest` always moves the window: the
+    // sender gets a new key every 1000 seqs, so refusing an honest jump is
+    // how an outage stalls a session for good.
     pub fn check(&mut self, seq: u64) -> WindowOutcome {
         if seq > self.highest {
             let d = seq - self.highest;
             if d >= REPLAY_WINDOW as u64 {
-                return WindowOutcome::TooFar;
+                self.bits = [0; REPLAY_WINDOW / 64];
+            } else {
+                self.shift(d as usize);
             }
-            self.shift(d as usize);
             self.highest = seq;
             self.set_bit(0);
             return WindowOutcome::Fresh;
@@ -356,27 +366,27 @@ mod tests {
 
     #[test]
     fn replay_window_boundaries() {
-        // The first packet does not choose where the window sits.
-        assert_eq!(ReplayWindow::default().check(REPLAY_WINDOW as u64), WindowOutcome::TooFar);
         let mut w = ReplayWindow::default();
         assert_eq!(w.check(0), WindowOutcome::Fresh);
         assert_eq!(w.check(0), WindowOutcome::Seen);
-        for s in [1500u64, 3000, 4500] {
+        for s in [1500u64, 3000, 4500, 5000] {
             assert_eq!(w.check(s), WindowOutcome::Fresh);
         }
-        assert_eq!(w.check(5000), WindowOutcome::Fresh); assert_eq!(w.check(5000), WindowOutcome::Seen);
+        assert_eq!(w.check(5000), WindowOutcome::Seen);
         assert_eq!(w.check(5001), WindowOutcome::Fresh);
         assert_eq!(w.check(4999), WindowOutcome::Fresh);
         assert_eq!(w.check(4999), WindowOutcome::Seen);
         // behind the window
         assert_eq!(w.check(5001 - REPLAY_WINDOW as u64), WindowOutcome::TooOld);
-        // too far ahead: rejected, window not advanced
-        assert_eq!(w.check(5001 + REPLAY_WINDOW as u64 + 10), WindowOutcome::TooFar);
-        assert_eq!(w.check(5001), WindowOutcome::Seen);
-        // inside and new
-        assert_eq!(w.check(5002), WindowOutcome::Fresh);
-        // jump inside window advances it
-        assert_eq!(w.check(5001 + 1500), WindowOutcome::Fresh);
-        assert_eq!(w.check(5002), WindowOutcome::Seen); assert_eq!(w.check(5000), WindowOutcome::Seen); // both still inside the advanced window
+        // a jump past the window is accepted and moves it; nothing older survives
+        let far = 5001 + REPLAY_WINDOW as u64 + 10;
+        assert_eq!(w.check(far), WindowOutcome::Fresh);
+        assert_eq!(w.check(far), WindowOutcome::Seen);
+        assert_eq!(w.check(5001), WindowOutcome::TooOld);
+        assert_eq!(w.check(far - 1), WindowOutcome::Fresh);
+        // the guard that runs before authentication
+        assert!(!w.too_far(far + MAX_LOOKAHEAD - 1));
+        assert!(w.too_far(far + MAX_LOOKAHEAD));
+        assert!(!w.too_far(0));
     }
 }
