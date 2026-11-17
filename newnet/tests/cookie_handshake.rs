@@ -1,8 +1,7 @@
-// Step 4 (A3 4a): the return-routability cookie on both sides, behind the
-// require_cookie switch. Every test here turns the switch on the responder
-// side; since 4b the switch is on by default, so every other test does the
-// cookie round too. Order rules tested are spec 4.4 (responder) and 4.5
-// (initiator).
+// Step 4 (A3 4c): the return-routability cookie on both sides. The cookie
+// is always required, so every test here does the cookie round, as every
+// other test in the crate does. Order rules tested are spec 4.4
+// (responder) and 4.5 (initiator).
 
 use newnet::crypto::PeerRecord;
 use newnet::link::Hub;
@@ -20,7 +19,6 @@ fn pair_names(a_name: &str) -> (Node, Node) {
     a.records.insert("bob".into(), rec_b);
     b.records.insert(a_name.into(), rec_a);
     b.set_cookie_secret_for_test([0x5C; 32], 0);
-    b.set_require_cookie(true);
     (a, b)
 }
 
@@ -125,7 +123,7 @@ fn cookie_is_bound_to_conn_id() {
     assert_eq!(b.half_open_count(), 0);
 }
 
-// 5. Through the hub, with the switch on, the exchange is exactly six
+// 5. Through the hub, the exchange is exactly six
 // datagrams: HS1, COOKIE, HS1, HS2, DATA(PING), DATA(ack) (spec 2.7), and
 // both sides end Open.
 #[test]

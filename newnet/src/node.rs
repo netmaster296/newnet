@@ -116,8 +116,6 @@ pub struct Node {
     last_tick: u64,
     // Responder cookie secrets (rotation at the top of every HANDSHAKE1).
     cookies: CookieKeys,
-    // Step 4a switch: false = treat every HANDSHAKE1 cookie as valid.
-    require_cookie: bool,
 }
 
 impl Node {
@@ -141,15 +139,7 @@ impl Node {
             budget_total: 0,
             last_tick: 0,
             cookies: CookieKeys::new(0),
-            require_cookie: true,
         }
-    }
-
-    // Step 4a switch, on by default since 4b. False: the responder treats
-    // every HANDSHAKE1 as if its cookie were valid. The initiator side of
-    // the COOKIE datagram is always live. 4c removes the switch.
-    pub fn set_require_cookie(&mut self, on: bool) {
-        self.require_cookie = on;
     }
 
     // Fixed cookie secret for tests; also the published-vector hook.
@@ -303,17 +293,15 @@ impl Node {
         // 3. Cookie (spec 4.4): one HMAC, no table, no DH. A bad or absent
         // cookie is answered with a 40-byte COOKIE, nothing else.
         self.cookies.rotate_if_due(tick);
-        if self.require_cookie {
-            let mut want = [0u8; cookie::COOKIE_LEN];
-            want.copy_from_slice(&pkt.body[..cookie::COOKIE_LEN]);
-            if !self.cookies.check(src, conn, &want) {
-                let made = self.cookies.make(src, conn);
-                self.stats.cookies_sent += 1;
-                return vec![wire::encode(
-                    &wire::Header { version: wire::VERSION, ptype: wire::TYPE_COOKIE, conn_id: conn, seq: 0, len: cookie::COOKIE_LEN as u16 },
-                    &made,
-                )];
-            }
+        let mut want = [0u8; cookie::COOKIE_LEN];
+        want.copy_from_slice(&pkt.body[..cookie::COOKIE_LEN]);
+        if !self.cookies.check(src, conn, &want) {
+            let made = self.cookies.make(src, conn);
+            self.stats.cookies_sent += 1;
+            return vec![wire::encode(
+                &wire::Header { version: wire::VERSION, ptype: wire::TYPE_COOKIE, conn_id: conn, seq: 0, len: cookie::COOKIE_LEN as u16 },
+                &made,
+            )];
         }
         // A live conn is never reset by a replayed HS1.
         if self.sessions.contains_key(&conn) {
