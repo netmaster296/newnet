@@ -170,4 +170,12 @@ impl UdpEndpoint {
     pub fn queued(&self) -> usize {
         self.out.len()
     }
+
+    // Send CLOSE to wherever this conn is addressed and free local state.
+    pub fn close(&mut self, conn: u64) {
+        let to = self.node.addr_of(conn);
+        if let Some(dgram) = self.node.close(conn) {
+            self.queue_to(to, dgram);
+        }
+    }
 }
