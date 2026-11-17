@@ -23,7 +23,9 @@ fn handshake_roundtrip_opens_both_sides() {
     assert_eq!(hs2s.len(), 1, "responder replies with msg2");
     let outs = a.on_datagram(&hs2s[0], 1);
     assert_eq!(outs.len(), 1, "initiator confirms its keys with one packet");
-    assert!(b.on_datagram(&outs[0], 1).is_empty());
+    let reply = b.on_datagram(&outs[0], 1);
+    assert_eq!(reply.len(), 1, "responder answers the confirming PING");
+    assert!(a.on_datagram(&reply[0], 1).is_empty());
     assert!(a.is_open(conn), "initiator open: {:?}", a.logs);
     assert!(b.is_open(conn), "responder open");
     assert_eq!(a.sessions[&conn].transcript, b.sessions[&conn].transcript);

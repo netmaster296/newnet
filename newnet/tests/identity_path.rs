@@ -46,7 +46,9 @@ fn responder_pins_on_first_handshake_and_refuses_a_changed_key() {
     assert_eq!(hs2.len(), 1);
     let confirm = a.on_datagram(&hs2[0], 1);
     assert_eq!(confirm.len(), 1);
-    assert!(b.on_datagram(&confirm[0], 1).is_empty());
+    let reply = b.on_datagram(&confirm[0], 1);
+    assert_eq!(reply.len(), 1, "responder answers the confirming PING");
+    assert!(a.on_datagram(&reply[0], 1).is_empty());
     assert!(a.is_open(conn) && b.is_open(conn));
     assert_eq!(b.pins.get("alice").unwrap().x25519, a.ident.x_pub.to_bytes());
 
