@@ -17,25 +17,22 @@ pub enum WindowOutcome {
 
 #[derive(Clone)]
 pub struct ReplayWindow {
-    started: bool,
     highest: u64,
     bits: [u64; REPLAY_WINDOW / 64],
 }
 
+// The window starts at sequence 0, where every sender starts. It does not
+// anchor on whichever packet happens to arrive first: a reordered packet
+// from far ahead used to become the anchor, and everything sent before it
+// was then rejected as too old.
 impl Default for ReplayWindow {
     fn default() -> Self {
-        ReplayWindow { started: false, highest: 0, bits: [0; REPLAY_WINDOW / 64] }
+        ReplayWindow { highest: 0, bits: [0; REPLAY_WINDOW / 64] }
     }
 }
 
 impl ReplayWindow {
     pub fn check(&mut self, seq: u64) -> WindowOutcome {
-        if !self.started {
-            self.started = true;
-            self.highest = seq;
-            self.set_bit(0);
-            return WindowOutcome::Fresh;
-        }
         if seq > self.highest {
             let d = seq - self.highest;
             if d >= REPLAY_WINDOW as u64 {
@@ -234,7 +231,14 @@ mod tests {
 
     #[test]
     fn replay_window_boundaries() {
+        // The first packet does not choose where the window sits.
+        assert_eq!(ReplayWindow::default().check(REPLAY_WINDOW as u64), WindowOutcome::TooFar);
         let mut w = ReplayWindow::default();
+        assert_eq!(w.check(0), WindowOutcome::Fresh);
+        assert_eq!(w.check(0), WindowOutcome::Seen);
+        for s in [1500u64, 3000, 4500] {
+            assert_eq!(w.check(s), WindowOutcome::Fresh);
+        }
         assert_eq!(w.check(5000), WindowOutcome::Fresh); assert_eq!(w.check(5000), WindowOutcome::Seen);
         assert_eq!(w.check(5001), WindowOutcome::Fresh);
         assert_eq!(w.check(4999), WindowOutcome::Fresh);
