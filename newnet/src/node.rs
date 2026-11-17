@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use ed25519_dalek::VerifyingKey;
+use rand::RngCore;
 
 use crate::content::{self, Msg, Reader};
 use crate::crypto::{self, PeerRecord};
@@ -83,7 +84,6 @@ pub struct Node {
     pub stats: NodeStats,
     pub logs: Vec<String>,
     pub registry: Option<Registry>,
-    next_conn: u64,
     budget_tick: u64,
     budget_by_source: HashMap<Addr, u32>,
     budget_total: u32,
@@ -105,7 +105,6 @@ impl Node {
             stats: NodeStats::default(),
             logs: Vec::new(),
             registry: None,
-            next_conn: seed ^ 0xC0FFEE,
             budget_tick: u64::MAX,
             budget_by_source: HashMap::new(),
             budget_total: 0,
@@ -160,12 +159,30 @@ impl Node {
         self.start_attempt(name, eph, tick, 1, to)
     }
 
+    // A real endpoint calls this once at start with wall-clock milliseconds,
+    // so stamps keep increasing across restarts. The in-memory lab does not
+    // need it. The stamp never moves backwards.
+    pub fn set_stamp_base(&mut self, base: u64) {
+        if base > self.next_stamp {
+            self.next_stamp = base;
+        }
+    }
+
+    pub fn next_stamp(&self) -> u64 {
+        self.next_stamp
+    }
+
     // One handshake attempt: fresh IK machine bound to conn via prologue,
     // Hello(stamp, name) as the msg1 payload, stored for identical resends.
     fn start_attempt(&mut self, name: &str, eph: Option<[u8; 32]>, tick: u64, attempt: u32, to: Addr) -> Result<(u64, Vec<u8>), ConnectError> {
         let rec = self.resolve(name, tick)?;
-        let conn = self.next_conn;
-        self.next_conn = self.next_conn.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut rng = rand::rngs::OsRng;
+        let conn = loop {
+            let c = rng.next_u64();
+            if !self.sessions.contains_key(&c) && !self.pending_init.contains_key(&c) && !self.half_open.contains_key(&c) {
+                break c;
+            }
+        };
         self.next_stamp += 1;
         let stamp = self.next_stamp;
         let mut hs = InitiatorHandshake::new(&self.ident.x_static.to_bytes(), rec.x.as_bytes(), &noise_ik::prologue(conn), eph)
