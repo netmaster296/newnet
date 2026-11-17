@@ -4,8 +4,13 @@
 
 use std::collections::VecDeque;
 
+// Source address as the hub sees it: the sender's node index.
+pub type Addr = u32;
+// "Source unknown": used by the old entry points.
+pub const ADDR_ANY: Addr = u32::MAX;
+
 pub struct Hub {
-    queues: Vec<VecDeque<Vec<u8>>>,
+    queues: Vec<VecDeque<(usize, Vec<u8>)>>,
     pub tick: u64,
     loss_pct: u32,
     reorder_pct: u32,
@@ -52,10 +57,30 @@ impl Hub {
             }
             self.forwarded += 1;
             if (self.next() % 100) < self.reorder_pct as u64 {
-                self.queues[to].push_front(bytes.to_vec());
+                self.queues[to].push_front((from, bytes.to_vec()));
             } else {
-                self.queues[to].push_back(bytes.to_vec());
+                self.queues[to].push_back((from, bytes.to_vec()));
             }
+        }
+    }
+
+    // Unicast: same wire record, same loss and reorder draws, one recipient.
+    pub fn send_to(&mut self, from: usize, to: usize, bytes: &[u8]) {
+        if self.wire_records.len() < 300_000 {
+            self.wire_records.push(bytes.to_vec());
+        }
+        if to == from {
+            return;
+        }
+        if (self.next() % 100) < self.loss_pct as u64 {
+            self.dropped_loss += 1;
+            return;
+        }
+        self.forwarded += 1;
+        if (self.next() % 100) < self.reorder_pct as u64 {
+            self.queues[to].push_front((from, bytes.to_vec()));
+        } else {
+            self.queues[to].push_back((from, bytes.to_vec()));
         }
     }
 
@@ -64,7 +89,14 @@ impl Hub {
     }
 
     pub fn drain(&mut self, to: usize) -> Vec<Vec<u8>> {
-        let v: Vec<Vec<u8>> = self.queues[to].drain(..).collect();
+        let v: Vec<Vec<u8>> = self.queues[to].drain(..).map(|(_, b)| b).collect();
+        self.delivered += v.len() as u64;
+        v
+    }
+
+    // Drain naming the sender of each datagram.
+    pub fn drain_from(&mut self, to: usize) -> Vec<(Addr, Vec<u8>)> {
+        let v: Vec<(Addr, Vec<u8>)> = self.queues[to].drain(..).map(|(f, b)| (f as Addr, b)).collect();
         self.delivered += v.len() as u64;
         v
     }

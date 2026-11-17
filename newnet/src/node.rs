@@ -8,6 +8,7 @@ use ed25519_dalek::VerifyingKey;
 use crate::content::{self, Msg, Reader};
 use crate::crypto::{self, PeerRecord};
 use crate::identity::{Identity, PinStore};
+use crate::link::{Addr, ADDR_ANY};
 use crate::naming::{NameRecord, Registry};
 use crate::noise_ik::{self, Hello, InitiatorHandshake, ResponderHandshake};
 use crate::session::{Session, SessionError};
@@ -21,6 +22,9 @@ pub const HALF_OPEN_TTL: u64 = 20;
 pub const MAX_HALF_OPEN: usize = 64;
 pub const HS_RESENDS: u32 = 3;
 pub const HS_ATTEMPTS: u32 = 3;
+
+// Ceiling on all handshake DH work in one tick, whatever the source split.
+pub const HANDSHAKE_GLOBAL_BUDGET_PER_TICK: u32 = 64;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConnectError {
@@ -54,6 +58,7 @@ struct PendingInit {
     sent: u64,
     resends: u32,
     attempt: u32,
+    to: Addr,
 }
 
 struct HalfOpen {
@@ -61,6 +66,7 @@ struct HalfOpen {
     msg2: Vec<u8>,
     keys: crypto::SplitKeys,
     created: u64,
+    from: Addr,
 }
 
 pub struct Node {
@@ -79,7 +85,8 @@ pub struct Node {
     pub registry: Option<Registry>,
     next_conn: u64,
     budget_tick: u64,
-    budget_used: u32,
+    budget_by_source: HashMap<Addr, u32>,
+    budget_total: u32,
 }
 
 impl Node {
@@ -100,7 +107,8 @@ impl Node {
             registry: None,
             next_conn: seed ^ 0xC0FFEE,
             budget_tick: u64::MAX,
-            budget_used: 0,
+            budget_by_source: HashMap::new(),
+            budget_total: 0,
         }
     }
 
@@ -142,12 +150,19 @@ impl Node {
     }
 
     pub fn connect_at(&mut self, name: &str, eph: Option<[u8; 32]>, tick: u64) -> Result<(u64, Vec<u8>), ConnectError> {
-        self.start_attempt(name, eph, tick, 1)
+        self.start_attempt(name, eph, tick, 1, ADDR_ANY)
+    }
+
+    // connect with the destination address recorded: what `tick_sessions`
+    // retransmits are addressed to, and what the session falls back to when
+    // a reply arrives with an unknown source.
+    pub fn connect_to(&mut self, name: &str, to: Addr, eph: Option<[u8; 32]>, tick: u64) -> Result<(u64, Vec<u8>), ConnectError> {
+        self.start_attempt(name, eph, tick, 1, to)
     }
 
     // One handshake attempt: fresh IK machine bound to conn via prologue,
     // Hello(stamp, name) as the msg1 payload, stored for identical resends.
-    fn start_attempt(&mut self, name: &str, eph: Option<[u8; 32]>, tick: u64, attempt: u32) -> Result<(u64, Vec<u8>), ConnectError> {
+    fn start_attempt(&mut self, name: &str, eph: Option<[u8; 32]>, tick: u64, attempt: u32, to: Addr) -> Result<(u64, Vec<u8>), ConnectError> {
         let rec = self.resolve(name, tick)?;
         let conn = self.next_conn;
         self.next_conn = self.next_conn.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -161,7 +176,7 @@ impl Node {
             &wire::Header { version: wire::VERSION, ptype: wire::TYPE_HANDSHAKE1, conn_id: conn, seq: 0, len: body.len() as u16 },
             &body,
         );
-        self.pending_init.insert(conn, PendingInit { hs, datagram: datagram.clone(), peer: name.to_string(), sent: tick, resends: 0, attempt });
+        self.pending_init.insert(conn, PendingInit { hs, datagram: datagram.clone(), peer: name.to_string(), sent: tick, resends: 0, attempt, to });
         Ok((conn, datagram))
     }
 
@@ -173,8 +188,15 @@ impl Node {
         self.pending_init.len()
     }
 
-    // One hub datagram in, datagrams to send back out. Never panics.
+    // Old entry point: source unknown. All such datagrams share one
+    // budget bucket, so the per-node behaviour is unchanged.
     pub fn on_datagram(&mut self, bytes: &[u8], tick: u64) -> Vec<Vec<u8>> {
+        self.on_datagram_from(ADDR_ANY, bytes, tick)
+    }
+
+    // One hub datagram in, datagrams to send back out. Every datagram
+    // returned is a reply to `from`. Never panics.
+    pub fn on_datagram_from(&mut self, from: Addr, bytes: &[u8], tick: u64) -> Vec<Vec<u8>> {
         let pkt = match wire::decode(bytes) {
             Ok(p) => p,
             Err(wire::WireError::BadMagic) => {
@@ -187,14 +209,14 @@ impl Node {
             }
         };
         match pkt.header.ptype {
-            wire::TYPE_HANDSHAKE1 => self.on_hs1(pkt, bytes, tick),
-            wire::TYPE_HANDSHAKE2 => self.on_hs2(pkt, tick),
-            wire::TYPE_DATA => self.on_data(pkt, tick),
+            wire::TYPE_HANDSHAKE1 => self.on_hs1(pkt, bytes, tick, from),
+            wire::TYPE_HANDSHAKE2 => self.on_hs2(pkt, tick, from),
+            wire::TYPE_DATA => self.on_data(pkt, tick, from),
             _ => vec![],
         }
     }
 
-    fn on_hs1(&mut self, pkt: wire::Packet, bytes: &[u8], tick: u64) -> Vec<Vec<u8>> {
+    fn on_hs1(&mut self, pkt: wire::Packet, bytes: &[u8], tick: u64, from: Addr) -> Vec<Vec<u8>> {
         let conn = pkt.header.conn_id;
         // A live conn is never reset by a replayed HS1.
         if self.sessions.contains_key(&conn) {
@@ -213,13 +235,18 @@ impl Node {
         }
         if self.budget_tick != tick {
             self.budget_tick = tick;
-            self.budget_used = 0;
+            self.budget_by_source.clear();
+            self.budget_total = 0;
         }
-        if self.budget_used >= crypto::HANDSHAKE_DH_BUDGET_PER_TICK as u32 {
+        // Per-source budget, then a global ceiling on the tick's work:
+        // junk from one source cannot starve the others.
+        let used = self.budget_by_source.get(&from).copied().unwrap_or(0);
+        if used >= crypto::HANDSHAKE_DH_BUDGET_PER_TICK as u32 || self.budget_total >= HANDSHAKE_GLOBAL_BUDGET_PER_TICK {
             self.stats.handshake_dropped_budget += 1;
             return vec![];
         }
-        self.budget_used += 1;
+        *self.budget_by_source.entry(from).or_insert(0) += 1;
+        self.budget_total += 1;
         self.stats.dh_count += 2; // es and ss happen inside msg1, before any payload check
         let mut hs = match ResponderHandshake::new(&self.ident.x_static.to_bytes(), &noise_ik::prologue(conn), None) {
             Ok(h) => h,
@@ -277,11 +304,11 @@ impl Node {
             &wire::Header { version: wire::VERSION, ptype: wire::TYPE_HANDSHAKE2, conn_id: conn, seq: 0, len: msg2.len() as u16 },
             &msg2,
         );
-        self.half_open.insert(conn, HalfOpen { msg1: bytes.to_vec(), msg2: datagram2.clone(), keys, created: tick });
+        self.half_open.insert(conn, HalfOpen { msg1: bytes.to_vec(), msg2: datagram2.clone(), keys, created: tick, from });
         vec![datagram2]
     }
 
-    fn on_hs2(&mut self, pkt: wire::Packet, tick: u64) -> Vec<Vec<u8>> {
+    fn on_hs2(&mut self, pkt: wire::Packet, tick: u64, from: Addr) -> Vec<Vec<u8>> {
         let conn = pkt.header.conn_id;
         if !self.pending_init.contains_key(&conn) {
             self.stats.no_session_dropped += 1;
@@ -297,8 +324,11 @@ impl Node {
                 return vec![];
             }
         };
-        self.pending_init.remove(&conn);
+        let removed = self.pending_init.remove(&conn).unwrap();
         let mut s = Session::from_split(conn, &keys, true);
+        // Follow the packet; fall back to the recorded destination when the
+        // reply arrived with an unknown source.
+        s.peer_addr = if from == ADDR_ANY { removed.to } else { from };
         let ping = s.seal_frame(&Frame { ftype: crate::streams::FRAME_PING, id: 0, off: 0, cum: 0, sacks: vec![], data: vec![] });
         s.note_ping_sent(tick);
         self.logs.push(format!("handshake open conn={conn} transcript={}", hex::encode(s.transcript)));
@@ -307,7 +337,7 @@ impl Node {
         vec![ping]
     }
 
-    fn on_data(&mut self, pkt: wire::Packet, tick: u64) -> Vec<Vec<u8>> {
+    fn on_data(&mut self, pkt: wire::Packet, tick: u64, from: Addr) -> Vec<Vec<u8>> {
         let conn = pkt.header.conn_id;
         if self.sessions.contains_key(&conn) {
             let s = self.sessions.get_mut(&conn).unwrap();
@@ -326,6 +356,10 @@ impl Node {
                     return vec![];
                 }
             };
+            // Roaming: only an authenticated packet moves the peer address.
+            if from != ADDR_ANY {
+                s.peer_addr = from;
+            }
             self.handle_opened(conn, pt, tick)
         } else if let Some(half) = self.half_open.get(&conn) {
             // First DATA under a conn id proves the initiator holds the split
@@ -340,6 +374,8 @@ impl Node {
                 }
             };
             self.half_open.remove(&conn);
+            // The confirming packet names the peer.
+            s.peer_addr = from;
             self.sessions.insert(conn, s);
             self.stats.sessions_allocated += 1;
             // The replay window already recorded this packet: handle the
@@ -369,6 +405,21 @@ impl Node {
 
     pub fn is_open(&self, conn: u64) -> bool {
         matches!(self.sessions.get(&conn), Some(s) if s.state == crate::session::State::Open)
+    }
+
+    // Where datagrams for this conn should go: the learned peer address, or
+    // the recorded destination of an unfinished attempt.
+    pub fn addr_of(&self, conn: u64) -> Addr {
+        if let Some(s) = self.sessions.get(&conn) {
+            return s.peer_addr;
+        }
+        if let Some(p) = self.pending_init.get(&conn) {
+            return p.to;
+        }
+        if let Some(h) = self.half_open.get(&conn) {
+            return h.from;
+        }
+        ADDR_ANY
     }
 
     // Drop an unfinished initiator attempt (app-side retry).
@@ -448,7 +499,7 @@ impl Node {
             }
             let removed = self.pending_init.remove(&conn).unwrap();
             if removed.attempt < HS_ATTEMPTS {
-                if let Ok((new_conn, dgram)) = self.start_attempt(&removed.peer, None, now, removed.attempt + 1) {
+                if let Ok((new_conn, dgram)) = self.start_attempt(&removed.peer, None, now, removed.attempt + 1, removed.to) {
                     self.logs.push(format!("hs attempt {} conn={new_conn} to {}", removed.attempt + 1, removed.peer));
                     out.push((new_conn, dgram));
                 }

@@ -130,6 +130,9 @@ pub enum SessionError {
 
 pub struct Session {
     pub conn_id: u64,
+    // Where the peer is now: learned from authenticated packets, then
+    // followed when the peer roams.
+    pub peer_addr: crate::link::Addr,
     pub state: State,
     pub is_initiator: bool,
     tx: KeyChain,
@@ -167,6 +170,7 @@ impl Session {
         };
         Session {
             conn_id,
+            peer_addr: crate::link::ADDR_ANY,
             state: State::Open,
             is_initiator,
             tx: KeyChain::new(txk),
