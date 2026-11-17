@@ -21,6 +21,13 @@ pub const PING_RESENDS: u32 = 5;
 // retransmits sealed in one pump round (at most 3 x 512) stay inside the window.
 pub const MAX_IN_FLIGHT: usize = 512;
 
+// Out-of-order chunks one session will hold across all its streams. An
+// honest sender has at most MAX_IN_FLIGHT chunks in flight.
+pub const MAX_RX_BUFFERED: usize = 4 * MAX_IN_FLIGHT;
+
+// Receive streams per session.
+pub const MAX_STREAMS: usize = 16_384;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum WindowOutcome {
     Fresh,
@@ -136,6 +143,7 @@ pub struct Session {
     pub transcript: [u8; 32],
     pub stat_badtag: u64,
     pub stat_replay: u64,
+    pub stat_overlimit: u64,
     // True once any fresh packet from the peer has been opened: the peer
     // proved it holds the split keys.
     pub confirmed: bool,
@@ -146,6 +154,8 @@ pub struct Session {
     send_queue: std::collections::VecDeque<(u32, u64, Vec<u8>)>,
     // Always equals the sum of pending() over all tx_streams.
     in_flight_total: usize,
+    // Always equals the sum of buffered() over all rx_streams.
+    rx_buffered: usize,
 }
 
 impl Session {
@@ -170,16 +180,22 @@ impl Session {
             transcript: keys.transcript_hash,
             stat_badtag: 0,
             stat_replay: 0,
+            stat_overlimit: 0,
             confirmed: false,
             ping_sent: 0,
             pings: 0,
             send_queue: std::collections::VecDeque::new(),
             in_flight_total: 0,
+            rx_buffered: 0,
         }
     }
 
     pub fn in_flight_total(&self) -> usize {
         self.in_flight_total
+    }
+
+    pub fn rx_buffered(&self) -> usize {
+        self.rx_buffered
     }
 
     pub fn queued_chunks(&self) -> usize {
@@ -298,8 +314,27 @@ impl Session {
         let f = streams::decode_frame(pt).map_err(|_| SessionError::BadFrame)?;
         match f.ftype {
             streams::FRAME_STREAM => {
+                // A peer that finished the handshake is trusted to be who it
+                // says, not to be well behaved: cap what it can make this
+                // side hold. Refused frames create no state and get no ACK.
+                if !self.rx_streams.contains_key(&f.id) && self.rx_streams.len() >= MAX_STREAMS {
+                    self.stat_overlimit += 1;
+                    return Ok(vec![]);
+                }
+                let expected = self.rx_streams.get(&f.id).map(|r| r.expected).unwrap_or(0);
+                if f.off > expected && self.rx_buffered >= MAX_RX_BUFFERED {
+                    self.stat_overlimit += 1;
+                    return Ok(vec![]);
+                }
                 let rx = self.rx_streams.entry(f.id).or_default();
+                let before = rx.buffered();
                 let out = rx.put(f.off, &f.data);
+                let after = rx.buffered();
+                if after >= before {
+                    self.rx_buffered += after - before;
+                } else {
+                    self.rx_buffered -= before - after;
+                }
                 if !out.is_empty() {
                     self.delivered.entry(f.id).or_default().extend_from_slice(&out);
                 }
@@ -313,7 +348,12 @@ impl Session {
                 }])
             }
             streams::FRAME_ACK => {
-                let tx = self.tx_streams.entry(f.id).or_default();
+                // An ACK names a stream this side sent on. A peer inventing
+                // ids must not create sender state for them.
+                let tx = match self.tx_streams.get_mut(&f.id) {
+                    Some(t) => t,
+                    None => return Ok(vec![]),
+                };
                 let before = tx.pending();
                 tx.on_ack(f.cum, &f.sacks);
                 let released = before - tx.pending();
@@ -385,6 +425,7 @@ impl Session {
         }
         out.extend(self.flush(now));
         debug_assert_eq!(self.in_flight_total, self.tx_streams.values().map(|t| t.pending()).sum::<usize>());
+        debug_assert_eq!(self.rx_buffered, self.rx_streams.values().map(|r| r.buffered()).sum::<usize>());
         out
     }
 }

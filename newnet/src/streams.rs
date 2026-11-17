@@ -102,10 +102,24 @@ pub struct StreamRx {
 }
 
 impl StreamRx {
-    pub fn put(&mut self, off: u64, data: &[u8]) -> Vec<u8> {
+    pub fn buffered(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn put(&mut self, off: u64, mut data: &[u8]) -> Vec<u8> {
         if data.is_empty() || off + data.len() as u64 <= self.expected {
             return vec![];
         }
+        // A chunk starting below `expected` but ending above it would be
+        // stored under an offset the release loop can never reach, so it
+        // would sit in the buffer for ever. Trim the already-delivered
+        // prefix and treat the rest as starting at `expected`.
+        let off = if off < self.expected {
+            data = &data[(self.expected - off) as usize..];
+            self.expected
+        } else {
+            off
+        };
         self.buf.entry(off).or_insert_with(|| data.to_vec());
         let mut out = Vec::new();
         while let Some(bytes) = self.buf.remove(&self.expected) {
@@ -264,6 +278,15 @@ mod tests {
         all.extend(rx.put(0, &chunks[0])); // fully duplicate: nothing
         assert!(all.is_empty());
         let _ = out;
+    }
+
+    #[test]
+    fn a_chunk_overlapping_delivered_bytes_is_trimmed() {
+        let mut rx = StreamRx::default();
+        rx.put(0, &[1, 2, 3, 4]);
+        assert_eq!(rx.put(2, &[3, 4, 5, 6]), vec![5, 6]);
+        assert_eq!(rx.expected, 6);
+        assert_eq!(rx.buffered(), 0);
     }
 
     #[test]
