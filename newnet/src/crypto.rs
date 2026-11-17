@@ -105,7 +105,10 @@ impl KeyChain {
 
 pub struct PeerRecord {
     pub name: String,
-    pub ed: VerifyingKey,
+    // The Ed25519 half is present for registry/TOFU records and absent for a
+    // peer imported from the peers file, where the X25519 key alone is the
+    // authority (spec 3.5: the file is the pin).
+    pub ed: Option<VerifyingKey>,
     pub x: XPublic,
     pub expiry: u64,
 }

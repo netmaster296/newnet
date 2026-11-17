@@ -13,8 +13,8 @@ use common::complete_cookie_round;
 fn pair() -> (Node, Node) {
     let mut a = Node::new("alice", 0xA11CE);
     let mut b = Node::new("bob", 0xB0B);
-    let rec_b = PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX };
-    let rec_a = PeerRecord { name: "alice".into(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX };
+    let rec_b = PeerRecord { name: "bob".into(), ed: Some(b.ident.ed_pub()), x: b.ident.x_pub, expiry: u64::MAX };
+    let rec_a = PeerRecord { name: "alice".into(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX };
     a.records.insert("bob".into(), rec_b);
     b.records.insert("alice".into(), rec_a);
     (a, b)
@@ -61,11 +61,11 @@ fn responder_pins_on_first_handshake_and_refuses_a_changed_key() {
     let mut a2 = Node::new("alice", 0xBAD);
     a2.records.insert(
         "bob".into(),
-        PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX },
+        PeerRecord { name: "bob".into(), ed: Some(b.ident.ed_pub()), x: b.ident.x_pub, expiry: u64::MAX },
     );
     b.records.insert(
         "alice".into(),
-        PeerRecord { name: "alice".into(), ed: a2.ident.ed_pub(), x: a2.ident.x_pub, expiry: u64::MAX },
+        PeerRecord { name: "alice".into(), ed: Some(a2.ident.ed_pub()), x: a2.ident.x_pub, expiry: u64::MAX },
     );
     let (_, hs1_2) = a2.connect("bob", None).unwrap();
     let before = b.stats.auth_fails;
@@ -85,7 +85,7 @@ fn initiator_pins_the_responder_on_first_connect() {
     let bad = Node::new("bob", 0xBAD);
     a.records.insert(
         "bob".into(),
-        PeerRecord { name: "bob".into(), ed: bad.ident.ed_pub(), x: bad.ident.x_pub, expiry: u64::MAX },
+        PeerRecord { name: "bob".into(), ed: Some(bad.ident.ed_pub()), x: bad.ident.x_pub, expiry: u64::MAX },
     );
     assert_eq!(a.connect("bob", None), Err(ConnectError::Pin(IdentityError::PinMismatch)));
 }

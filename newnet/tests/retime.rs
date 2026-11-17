@@ -64,7 +64,7 @@ fn connect_uses_the_last_tick_seen() {
     let b = Node::new("bob", 0xB0B);
     a.records.insert(
         "bob".into(),
-        PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX },
+        PeerRecord { name: "bob".into(), ed: Some(b.ident.ed_pub()), x: b.ident.x_pub, expiry: u64::MAX },
     );
     a.tick_sessions(37, 500);
     a.connect("bob", None).unwrap();

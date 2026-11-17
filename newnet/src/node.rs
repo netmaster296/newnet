@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use ed25519_dalek::VerifyingKey;
 use rand::RngCore;
+use x25519_dalek::PublicKey as XPublic;
 
 use crate::content::{self, Msg, Reader};
 use crate::cookie::{self, CookieKeys, SrcKey};
@@ -14,6 +15,7 @@ use crate::identity::{Identity, PinStore};
 use crate::link::{Addr, ADDR_ANY};
 use crate::naming::{NameRecord, Registry};
 use crate::noise_ik::{self, Hello, InitiatorHandshake, ResponderHandshake};
+use crate::peerbook::PeerLine;
 use crate::session::{Session, SessionError, IDLE_TTL};
 use crate::streams::Frame;
 use crate::wire;
@@ -135,9 +137,16 @@ pub struct Node {
 
 impl Node {
     pub fn new(name: &str, seed: u64) -> Node {
+        Node::from_identity(name, Identity::from_seed(seed))
+    }
+
+    // A node whose identity comes from a key file rather than a demo seed
+    // (spec 3.5). Everything else starts empty: the peers are added by
+    // add_peer from the peers file.
+    pub fn from_identity(name: &str, ident: Identity) -> Node {
         Node {
             name: name.to_string(),
-            ident: Identity::from_seed(seed),
+            ident,
             pins: PinStore::default(),
             records: HashMap::new(),
             sessions: HashMap::new(),
@@ -158,6 +167,21 @@ impl Node {
         }
     }
 
+    // One line of the peers file becomes one record. The Ed25519 half is
+    // absent: a name imported from the file is trusted for its X25519 key,
+    // and expiry is checked at load, not here (spec 3.5).
+    pub fn add_peer(&mut self, l: &PeerLine) {
+        self.records.insert(
+            l.name.clone(),
+            PeerRecord {
+                name: l.name.clone(),
+                ed: None,
+                x: XPublic::from(l.key),
+                expiry: l.expires.unwrap_or(u64::MAX),
+            },
+        );
+    }
+
     // Fixed cookie secret for tests; also the published-vector hook.
     pub fn set_cookie_secret_for_test(&mut self, secret: [u8; 32], now: u64) {
         self.cookies = CookieKeys::from_secret_for_test(secret, now);
@@ -169,7 +193,7 @@ impl Node {
         }
         let reg = self.registry.as_ref()?;
         let rec = reg.get(name)?;
-        Some(PeerRecord { name: rec.name.clone(), ed: VerifyingKey::from_bytes(&rec.ed).ok()?, x: rec.x_pub(), expiry: rec.expiry })
+        Some(PeerRecord { name: rec.name.clone(), ed: Some(VerifyingKey::from_bytes(&rec.ed).ok()?), x: rec.x_pub(), expiry: rec.expiry })
     }
 
     // TOFU pin store feeds the record cache. Pin mismatch fails closed.
@@ -179,7 +203,7 @@ impl Node {
             .map_err(ConnectError::Pin)?;
         self.records.insert(
             rec.name.clone(),
-            PeerRecord { name: rec.name.clone(), ed: VerifyingKey::from_bytes(&rec.ed).map_err(|_| ConnectError::NoRecord)?, x: rec.x_pub(), expiry: rec.expiry },
+            PeerRecord { name: rec.name.clone(), ed: Some(VerifyingKey::from_bytes(&rec.ed).map_err(|_| ConnectError::NoRecord)?), x: rec.x_pub(), expiry: rec.expiry },
         );
         Ok(())
     }
@@ -189,8 +213,12 @@ impl Node {
         if rec.expiry < now {
             return Err(ConnectError::Pin(crate::identity::IdentityError::CertExpired));
         }
+        // A peers-file record carries no Ed25519 key: it pins on zeros, so
+        // the pin is the name plus the X25519 key and a key swap under a
+        // running node still fails closed (spec 3.5).
+        let ed_pin = rec.ed.map(|k| k.to_bytes()).unwrap_or([0u8; 32]);
         self.pins
-            .check_or_pin(&rec.name, rec.ed.to_bytes(), rec.x.to_bytes(), rec.expiry, now)
+            .check_or_pin(&rec.name, ed_pin, rec.x.to_bytes(), rec.expiry, now)
             .map_err(ConnectError::Pin)?;
         Ok(rec)
     }
@@ -821,3 +849,61 @@ pub fn pump_registry(node: &mut Node, now: u64) -> Vec<(u64, Vec<u8>)> {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keyfile;
+    use crate::peerbook::{self, PeerLine};
+
+    // The line a person carries: format on one machine, parse on the other.
+    fn line_for(name: &str, secret: [u8; 32]) -> PeerLine {
+        let l = PeerLine { name: name.to_string(), key: keyfile::public_of(&secret), expires: None };
+        peerbook::parse_pub_line(&peerbook::format_pub_line(&l)).expect("the line round-trips")
+    }
+
+    // Two nodes built from fresh key files, peers imported from the files,
+    // handshake through the lab hub. A third node whose line was never
+    // imported costs one auth_fails and no state (spec 3.5).
+    #[test]
+    fn node_from_identity_handshakes_with_imported_peer() {
+        let ka = keyfile::generate("alice").unwrap();
+        let kb = keyfile::generate("bob").unwrap();
+        let mut a = Node::from_identity(&ka.name, Identity::from_secret(ka.secret));
+        let mut b = Node::from_identity(&kb.name, Identity::from_secret(kb.secret));
+        a.add_peer(&line_for(&kb.name, kb.secret));
+        b.add_peer(&line_for(&ka.name, ka.secret));
+
+        let (conn, hs1) = a.connect_at("bob", None, 1).unwrap();
+        let cookie = b.on_datagram_from(ADDR_ANY, &hs1, 1);
+        assert_eq!(cookie.len(), 1, "a zero-cookie HANDSHAKE1 is answered with a COOKIE");
+        let rebuilt = a.on_datagram(&cookie[0], 1);
+        assert_eq!(rebuilt.len(), 1, "the initiator answers the COOKIE with one datagram");
+        let hs2 = b.on_datagram_from(ADDR_ANY, &rebuilt[0], 1);
+        assert_eq!(hs2.len(), 1, "the cookie-bearing HANDSHAKE1 gets a HANDSHAKE2: {:?}", b.stats);
+        let confirm = a.on_datagram(&hs2[0], 1);
+        assert_eq!(confirm.len(), 1);
+        let reply = b.on_datagram_from(ADDR_ANY, &confirm[0], 1);
+        assert_eq!(reply.len(), 1);
+        assert!(a.on_datagram(&reply[0], 1).is_empty());
+        assert!(a.is_open(conn) && b.is_open(conn), "a node from key files completes the handshake: {:?} {:?}", a.stats, b.stats);
+        assert_eq!(a.stats.auth_fails, 0, "nothing failed on the way: {:?}", a.logs);
+        assert_eq!(b.stats.auth_fails, 0, "nothing failed on the way: {:?}", b.logs);
+
+        let kc = keyfile::generate("carol").unwrap();
+        let mut c = Node::from_identity(&kc.name, Identity::from_secret(kc.secret));
+        c.add_peer(&line_for("bob", kb.secret));
+        let (cconn, chs1) = c.connect_at("bob", None, 2).unwrap();
+        let ck = b.on_datagram_from(ADDR_ANY, &chs1, 2);
+        assert_eq!(ck.len(), 1, "carol is answered with a COOKIE like anyone else");
+        assert_eq!(wire::decode(&ck[0]).unwrap().header.ptype, wire::TYPE_COOKIE);
+        let again = c.on_datagram(&ck[0], 2);
+        assert_eq!(again.len(), 1);
+        let out = b.on_datagram_from(ADDR_ANY, &again[0], 2);
+        assert!(out.is_empty(), "a key that was never imported is refused without a reply: {:?}", b.stats);
+        assert_eq!(b.stats.auth_fails, 1, "the refusal is counted exactly once");
+        assert_eq!(b.half_open_count(), 0, "it leaves no half-open state");
+        assert_eq!(b.sessions.len(), 1, "it leaves no session either: only alice is open");
+        assert!(!c.is_open(cconn), "carol has no session");
+    }
+}

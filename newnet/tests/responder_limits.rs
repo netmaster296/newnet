@@ -12,8 +12,8 @@ use common::complete_cookie_round;
 fn pair() -> (Node, Node) {
     let mut a = Node::new("alice", 0xA11CE);
     let mut b = Node::new("bob", 0xB0B);
-    let rec_b = PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX };
-    let rec_a = PeerRecord { name: "alice".into(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX };
+    let rec_b = PeerRecord { name: "bob".into(), ed: Some(b.ident.ed_pub()), x: b.ident.x_pub, expiry: u64::MAX };
+    let rec_a = PeerRecord { name: "alice".into(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX };
     a.records.insert("bob".into(), rec_b);
     b.records.insert("alice".into(), rec_a);
     (a, b)
@@ -101,12 +101,12 @@ fn sixty_fifth_session_is_refused() {
     // 16 peer names by 4 sessions each = 64; the 65th is refused outright.
     let (_a0, mut b) = pair();
     let mut a = Node::new("peer0", 0xA11CE);
-    a.records.insert("bob".into(), PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX });
+    a.records.insert("bob".into(), PeerRecord { name: "bob".into(), ed: Some(b.ident.ed_pub()), x: b.ident.x_pub, expiry: u64::MAX });
     let mut n = 0u64;
     for i in 0..16u64 {
         let name = format!("peer{i}");
         a.name = name.clone();
-        b.records.insert(name.clone(), PeerRecord { name: name.clone(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX });
+        b.records.insert(name.clone(), PeerRecord { name: name.clone(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX });
         for j in 0..4u64 {
             // four opens per 20-tick budget epoch: the per-source handshake
             // budget is not the limit here.
@@ -120,7 +120,7 @@ fn sixty_fifth_session_is_refused() {
     assert_eq!(b.stats.sessions_evicted_peer, 0);
 
     a.name = "peer16".into();
-    b.records.insert("peer16".into(), PeerRecord { name: "peer16".into(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX });
+    b.records.insert("peer16".into(), PeerRecord { name: "peer16".into(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX });
     let (c65, hs1) = a.connect_at("bob", None, 16 * BUDGET_EPOCH_TICKS).unwrap();
     let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
     let hs2 = b.on_datagram(&hs1, 16 * BUDGET_EPOCH_TICKS);
@@ -150,13 +150,13 @@ fn restart_with_clock_stamp_passes_and_old_recording_fails() {
 
     // Bob restarts: new process, stamp floor five minutes before start.
     let mut b2 = Node::new("bob", 0xB0B);
-    b2.records.insert("alice".into(), PeerRecord { name: "alice".into(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX });
+    b2.records.insert("alice".into(), PeerRecord { name: "alice".into(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX });
     b2.set_stamp_base(now);
     b2.set_stamp_floor(now - 300_000);
 
     // A fresh alice at the clock stamp passes.
     let mut a2 = Node::new("alice", 0xA11CE);
-    a2.records.insert("bob".into(), PeerRecord { name: "bob".into(), ed: b2.ident.ed_pub(), x: b2.ident.x_pub, expiry: u64::MAX });
+    a2.records.insert("bob".into(), PeerRecord { name: "bob".into(), ed: Some(b2.ident.ed_pub()), x: b2.ident.x_pub, expiry: u64::MAX });
     a2.set_stamp_base(now);
     let (_cfresh, hs1) = a2.connect("bob", None).unwrap();
     let hs1 = complete_cookie_round(&mut a2, &mut b2, hs1, ADDR_ANY);

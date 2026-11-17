@@ -110,8 +110,8 @@ mod mini {
 fn pair() -> (Node, Node) {
     let mut a = Node::new("alice", 0xA11CE);
     let mut b = Node::new("bob", 0xB0B);
-    let rec_b = PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX };
-    let rec_a = PeerRecord { name: "alice".into(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX };
+    let rec_b = PeerRecord { name: "bob".into(), ed: Some(b.ident.ed_pub()), x: b.ident.x_pub, expiry: u64::MAX };
+    let rec_a = PeerRecord { name: "alice".into(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX };
     a.records.insert("bob".into(), rec_b);
     b.records.insert("alice".into(), rec_a);
     (a, b)
@@ -257,7 +257,7 @@ fn half_open_table_is_bounded() {
         // (step 5), so filling the global table takes one name per conn.
         let name = format!("peer{i}");
         a.name = name.clone();
-        b.records.insert(name.clone(), PeerRecord { name: name.clone(), ed: a.ident.ed_pub(), x: a.ident.x_pub, expiry: u64::MAX });
+        b.records.insert(name.clone(), PeerRecord { name: name.clone(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX });
         let (_c, hs1) = a.connect("bob", None).unwrap();
         let hs1 = complete_cookie_round(&mut a, &mut b, hs1, ADDR_ANY);
         b.on_datagram(&hs1, 100 + i * BUDGET_EPOCH_TICKS); // a new budget epoch each time, so the DH budget is not the limit

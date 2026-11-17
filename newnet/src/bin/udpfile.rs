@@ -122,7 +122,7 @@ fn node_with_peer(o: &Opts) -> Node {
     let id = Identity::from_seed(o.peer_seed);
     node.records.insert(
         o.peer.clone(),
-        PeerRecord { name: o.peer.clone(), ed: id.ed_pub(), x: id.x_pub, expiry: u64::MAX },
+        PeerRecord { name: o.peer.clone(), ed: Some(id.ed_pub()), x: id.x_pub, expiry: u64::MAX },
     );
     node
 }

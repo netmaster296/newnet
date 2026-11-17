@@ -100,7 +100,7 @@ fn main() {
         nodes[i].pins.check_or_pin("registry.example", *anchor.ed_pub().as_bytes(), anchor.x_pub.as_bytes().to_owned(), u64::MAX, NOW).unwrap();
         nodes[i].records.insert(
             "registry.example".into(),
-            newnet::crypto::PeerRecord { name: "registry.example".into(), ed: anchor.ed_pub(), x: anchor.x_pub, expiry: u64::MAX },
+            newnet::crypto::PeerRecord { name: "registry.example".into(), ed: Some(anchor.ed_pub()), x: anchor.x_pub, expiry: u64::MAX },
         );
     }
 

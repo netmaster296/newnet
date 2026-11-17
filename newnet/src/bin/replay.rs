@@ -245,7 +245,7 @@ fn main() {
     for (me, other) in [(0usize, 1usize), (1, 0)] {
         let rec = newnet::crypto::PeerRecord {
             name: nodes[other].name.clone(),
-            ed: nodes[other].ident.ed_pub().clone(),
+            ed: Some(nodes[other].ident.ed_pub().clone()),
             x: nodes[other].ident.x_pub,
             expiry: u64::MAX,
         };
