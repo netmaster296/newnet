@@ -7,6 +7,16 @@ use crate::wire;
 
 pub const REPLAY_WINDOW: usize = 2048;
 
+// How far ahead of the highest authenticated sequence number a header may
+// claim to be before it is refused without deriving a key. It bounds what a
+// forged header can cost (about a thousand key generations, once) and how
+// long an outage the session survives.
+pub const MAX_LOOKAHEAD: u64 = 1 << 20;
+
+// Pings a new initiator sends before the peer confirms, after which the
+// session is dropped as dead.
+pub const PING_RESENDS: u32 = 5;
+
 // A quarter of REPLAY_WINDOW, so that new chunks, gap retransmits and timer
 // retransmits sealed in one pump round (at most 3 x 512) stay inside the window.
 pub const MAX_IN_FLIGHT: usize = 512;
@@ -36,19 +46,23 @@ impl Default for ReplayWindow {
 }
 
 impl ReplayWindow {
-    // True when `check` would answer TooFar. Needs no key, so it can run
-    // before a packet is authenticated.
+    // True when the seq is beyond MAX_LOOKAHEAD of the highest authenticated
+    // seq. Needs no key, so it can run before a packet is authenticated.
     pub fn too_far(&self, seq: u64) -> bool {
-        seq > self.highest && seq - self.highest >= REPLAY_WINDOW as u64
+        seq > self.highest && seq - self.highest >= MAX_LOOKAHEAD
     }
 
+    // An authenticated seq above `highest` always moves the window: the
+    // sender gets a new key every 1000 seqs, so refusing an honest jump is
+    // how an outage stalls a session for good.
     pub fn check(&mut self, seq: u64) -> WindowOutcome {
         if seq > self.highest {
             let d = seq - self.highest;
             if d >= REPLAY_WINDOW as u64 {
-                return WindowOutcome::TooFar;
+                self.bits = [0; REPLAY_WINDOW / 64];
+            } else {
+                self.shift(d as usize);
             }
-            self.shift(d as usize);
             self.highest = seq;
             self.set_bit(0);
             return WindowOutcome::Fresh;
@@ -117,6 +131,11 @@ pub struct Session {
     pub transcript: [u8; 32],
     pub stat_badtag: u64,
     pub stat_replay: u64,
+    // True once any fresh packet from the peer has been opened: the peer
+    // proved it holds the split keys.
+    pub confirmed: bool,
+    ping_sent: u64,
+    pings: u32,
     // Chunks waiting for their first transmission, in the order the
     // application submitted them: (stream id, offset, chunk bytes).
     send_queue: std::collections::VecDeque<(u32, u64, Vec<u8>)>,
@@ -146,6 +165,9 @@ impl Session {
             transcript: keys.transcript_hash,
             stat_badtag: 0,
             stat_replay: 0,
+            confirmed: false,
+            ping_sent: 0,
+            pings: 0,
             send_queue: std::collections::VecDeque::new(),
             in_flight_total: 0,
         }
@@ -231,7 +253,10 @@ impl Session {
                 SessionError::BadTag
             })?;
         match self.window.check(seq) {
-            WindowOutcome::Fresh => Ok(pt),
+            WindowOutcome::Fresh => {
+                self.confirmed = true;
+                Ok(pt)
+            }
             other => {
                 self.stat_replay += 1;
                 Err(SessionError::Replay(other))
@@ -278,14 +303,54 @@ impl Session {
                 self.state = State::Closed;
                 Ok(vec![])
             }
-            streams::FRAME_PING => Ok(vec![]),
+            // PING id 0 is a request, answered once with id 1; a reply is
+            // never answered.
+            streams::FRAME_PING => {
+                if f.id == 0 {
+                    Ok(vec![Frame {
+                        ftype: streams::FRAME_PING,
+                        id: 1,
+                        off: 0,
+                        cum: 0,
+                        sacks: vec![],
+                        data: vec![],
+                    }])
+                } else {
+                    Ok(vec![])
+                }
+            }
             _ => Err(SessionError::BadFrame),
         }
     }
 
+    // Record when the liveness PING went out, so the timer starts there.
+    pub fn note_ping_sent(&mut self, now: u64) {
+        self.ping_sent = now;
+    }
+
     pub fn tick_timeouts(&mut self, now: u64, timeout: u64) -> Vec<Frame> {
-        let ids: Vec<u32> = self.tx_streams.keys().copied().collect();
+        // Initiator liveness: keep proving the peer got the handshake until
+        // it answers something. After PING_RESENDS silent probes the session
+        // is dead.
         let mut out = Vec::new();
+        if self.is_initiator && !self.confirmed && now >= self.ping_sent + timeout {
+            if self.pings < PING_RESENDS {
+                self.pings += 1;
+                self.ping_sent = now;
+                out.push(Frame {
+                    ftype: streams::FRAME_PING,
+                    id: 0,
+                    off: 0,
+                    cum: 0,
+                    sacks: vec![],
+                    data: vec![],
+                });
+            } else {
+                self.state = State::Closed;
+                return vec![];
+            }
+        }
+        let ids: Vec<u32> = self.tx_streams.keys().copied().collect();
         for id in ids {
             out.extend(self.tx_streams.get_mut(&id).unwrap().timeout(id, now, timeout));
         }
@@ -301,27 +366,27 @@ mod tests {
 
     #[test]
     fn replay_window_boundaries() {
-        // The first packet does not choose where the window sits.
-        assert_eq!(ReplayWindow::default().check(REPLAY_WINDOW as u64), WindowOutcome::TooFar);
         let mut w = ReplayWindow::default();
         assert_eq!(w.check(0), WindowOutcome::Fresh);
         assert_eq!(w.check(0), WindowOutcome::Seen);
-        for s in [1500u64, 3000, 4500] {
+        for s in [1500u64, 3000, 4500, 5000] {
             assert_eq!(w.check(s), WindowOutcome::Fresh);
         }
-        assert_eq!(w.check(5000), WindowOutcome::Fresh); assert_eq!(w.check(5000), WindowOutcome::Seen);
+        assert_eq!(w.check(5000), WindowOutcome::Seen);
         assert_eq!(w.check(5001), WindowOutcome::Fresh);
         assert_eq!(w.check(4999), WindowOutcome::Fresh);
         assert_eq!(w.check(4999), WindowOutcome::Seen);
         // behind the window
         assert_eq!(w.check(5001 - REPLAY_WINDOW as u64), WindowOutcome::TooOld);
-        // too far ahead: rejected, window not advanced
-        assert_eq!(w.check(5001 + REPLAY_WINDOW as u64 + 10), WindowOutcome::TooFar);
-        assert_eq!(w.check(5001), WindowOutcome::Seen);
-        // inside and new
-        assert_eq!(w.check(5002), WindowOutcome::Fresh);
-        // jump inside window advances it
-        assert_eq!(w.check(5001 + 1500), WindowOutcome::Fresh);
-        assert_eq!(w.check(5002), WindowOutcome::Seen); assert_eq!(w.check(5000), WindowOutcome::Seen); // both still inside the advanced window
+        // a jump past the window is accepted and moves it; nothing older survives
+        let far = 5001 + REPLAY_WINDOW as u64 + 10;
+        assert_eq!(w.check(far), WindowOutcome::Fresh);
+        assert_eq!(w.check(far), WindowOutcome::Seen);
+        assert_eq!(w.check(5001), WindowOutcome::TooOld);
+        assert_eq!(w.check(far - 1), WindowOutcome::Fresh);
+        // the guard that runs before authentication
+        assert!(!w.too_far(far + MAX_LOOKAHEAD - 1));
+        assert!(w.too_far(far + MAX_LOOKAHEAD));
+        assert!(!w.too_far(0));
     }
 }

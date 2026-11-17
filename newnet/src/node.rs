@@ -44,6 +44,7 @@ pub struct NodeStats {
     pub hs2_resent: u64,
     pub hs_replay_dropped: u64,
     pub half_open_dropped_full: u64,
+    pub sessions_dead: u64,
 }
 
 struct PendingInit {
@@ -187,7 +188,7 @@ impl Node {
         };
         match pkt.header.ptype {
             wire::TYPE_HANDSHAKE1 => self.on_hs1(pkt, bytes, tick),
-            wire::TYPE_HANDSHAKE2 => self.on_hs2(pkt),
+            wire::TYPE_HANDSHAKE2 => self.on_hs2(pkt, tick),
             wire::TYPE_DATA => self.on_data(pkt, tick),
             _ => vec![],
         }
@@ -280,7 +281,7 @@ impl Node {
         vec![datagram2]
     }
 
-    fn on_hs2(&mut self, pkt: wire::Packet) -> Vec<Vec<u8>> {
+    fn on_hs2(&mut self, pkt: wire::Packet, tick: u64) -> Vec<Vec<u8>> {
         let conn = pkt.header.conn_id;
         if !self.pending_init.contains_key(&conn) {
             self.stats.no_session_dropped += 1;
@@ -299,6 +300,7 @@ impl Node {
         self.pending_init.remove(&conn);
         let mut s = Session::from_split(conn, &keys, true);
         let ping = s.seal_frame(&Frame { ftype: crate::streams::FRAME_PING, id: 0, off: 0, cum: 0, sacks: vec![], data: vec![] });
+        s.note_ping_sent(tick);
         self.logs.push(format!("handshake open conn={conn} transcript={}", hex::encode(s.transcript)));
         self.sessions.insert(conn, s);
         self.stats.sessions_allocated += 1;
@@ -469,6 +471,18 @@ impl Node {
             for f in &frames {
                 out.push((*conn, s.seal_frame(f)));
             }
+        }
+        // Sessions whose peer never answered the liveness PING are dead.
+        let dead: Vec<u64> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.state == crate::session::State::Closed)
+            .map(|(c, _)| *c)
+            .collect();
+        for conn in dead {
+            self.sessions.remove(&conn);
+            self.stats.sessions_dead += 1;
+            self.logs.push(format!("session dead conn={conn}: peer never confirmed"));
         }
         out
     }

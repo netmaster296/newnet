@@ -24,7 +24,9 @@ fn open(a: &mut Node, b: &mut Node, eph: u8) -> (u64, Vec<u8>) {
     assert_eq!(hs2.len(), 1, "responder answers: {:?}", b.stats);
     let confirm = a.on_datagram(&hs2[0], 1);
     assert_eq!(confirm.len(), 1, "initiator proves its keys with one packet");
-    assert!(b.on_datagram(&confirm[0], 1).is_empty());
+    let reply = b.on_datagram(&confirm[0], 1);
+    assert_eq!(reply.len(), 1, "responder answers the confirming PING");
+    assert!(a.on_datagram(&reply[0], 1).is_empty());
     assert!(a.is_open(conn) && b.is_open(conn));
     (conn, hs1)
 }
