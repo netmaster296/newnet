@@ -1,5 +1,6 @@
 pub mod attacks;
 pub mod content;
+pub mod cookie;
 pub mod crypto;
 pub mod datagrams;
 pub mod identity;
