@@ -21,6 +21,13 @@ pub const PING_RESENDS: u32 = 5;
 // retransmits sealed in one pump round (at most 3 x 512) stay inside the window.
 pub const MAX_IN_FLIGHT: usize = 512;
 
+// Out-of-order chunks one session will hold across all its streams. An
+// honest sender has at most MAX_IN_FLIGHT chunks in flight.
+pub const MAX_RX_BUFFERED: usize = 4 * MAX_IN_FLIGHT;
+
+// Receive streams per session.
+pub const MAX_STREAMS: usize = 16_384;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum WindowOutcome {
     Fresh,
@@ -46,6 +53,11 @@ impl Default for ReplayWindow {
 }
 
 impl ReplayWindow {
+    // Highest authenticated sequence number seen.
+    pub fn highest(&self) -> u64 {
+        self.highest
+    }
+
     // True when the seq is beyond MAX_LOOKAHEAD of the highest authenticated
     // seq. Needs no key, so it can run before a packet is authenticated.
     pub fn too_far(&self, seq: u64) -> bool {
@@ -118,6 +130,9 @@ pub enum SessionError {
 
 pub struct Session {
     pub conn_id: u64,
+    // Where the peer is now: learned from authenticated packets, then
+    // followed when the peer roams.
+    pub peer_addr: crate::link::Addr,
     pub state: State,
     pub is_initiator: bool,
     tx: KeyChain,
@@ -131,6 +146,7 @@ pub struct Session {
     pub transcript: [u8; 32],
     pub stat_badtag: u64,
     pub stat_replay: u64,
+    pub stat_overlimit: u64,
     // True once any fresh packet from the peer has been opened: the peer
     // proved it holds the split keys.
     pub confirmed: bool,
@@ -141,6 +157,8 @@ pub struct Session {
     send_queue: std::collections::VecDeque<(u32, u64, Vec<u8>)>,
     // Always equals the sum of pending() over all tx_streams.
     in_flight_total: usize,
+    // Always equals the sum of buffered() over all rx_streams.
+    rx_buffered: usize,
 }
 
 impl Session {
@@ -152,6 +170,7 @@ impl Session {
         };
         Session {
             conn_id,
+            peer_addr: crate::link::ADDR_ANY,
             state: State::Open,
             is_initiator,
             tx: KeyChain::new(txk),
@@ -165,16 +184,22 @@ impl Session {
             transcript: keys.transcript_hash,
             stat_badtag: 0,
             stat_replay: 0,
+            stat_overlimit: 0,
             confirmed: false,
             ping_sent: 0,
             pings: 0,
             send_queue: std::collections::VecDeque::new(),
             in_flight_total: 0,
+            rx_buffered: 0,
         }
     }
 
     pub fn in_flight_total(&self) -> usize {
         self.in_flight_total
+    }
+
+    pub fn rx_buffered(&self) -> usize {
+        self.rx_buffered
     }
 
     pub fn queued_chunks(&self) -> usize {
@@ -211,7 +236,8 @@ impl Session {
         let seq = self.tx_seq;
         self.tx_seq += 1;
         let gen = seq / crypto::KEY_ROTATION_INTERVAL;
-        let key = self.tx.key_for(gen);
+        let key = self.tx.key_for(gen).expect("the current send generation is always held");
+        self.tx.forget_before(gen);
         let hdr = wire::Header {
             version: wire::VERSION,
             ptype: wire::TYPE_DATA,
@@ -224,9 +250,19 @@ impl Session {
         wire::encode(&hdr, &ct)
     }
 
-    // Receive-side key generations derived so far.
+    // Receive-side keys held now (older generations are erased).
     pub fn rx_generations(&self) -> usize {
         self.rx.generations()
+    }
+
+    // Highest authenticated sequence number this side has opened.
+    pub fn rx_highest(&self) -> u64 {
+        self.window.highest()
+    }
+
+    // Send-side keys held now: only the current generation.
+    pub fn tx_generations(&self) -> usize {
+        self.tx.generations()
     }
 
     // Open a DATA packet: AEAD first, then replay window. Returns plaintext.
@@ -245,7 +281,15 @@ impl Session {
             return Err(SessionError::Replay(WindowOutcome::TooFar));
         }
         let gen = seq / crypto::KEY_ROTATION_INTERVAL;
-        let key = self.rx.key_for(gen);
+        // A packet whose key was erased is older than the window: its key is
+        // gone, so it cannot be authenticated and is refused as too old.
+        let key = match self.rx.key_for(gen) {
+            Some(k) => k,
+            None => {
+                self.stat_replay += 1;
+                return Err(SessionError::Replay(WindowOutcome::TooOld));
+            }
+        };
         let hbytes = pkt.header_bytes();
         let pt = crypto::open(&key, seq, &hbytes, &pkt.body)
             .map_err(|_| {
@@ -255,6 +299,11 @@ impl Session {
         match self.window.check(seq) {
             WindowOutcome::Fresh => {
                 self.confirmed = true;
+                // Only an authenticated packet erases keys. Erase everything
+                // below the window: a later packet inside the window still
+                // finds its key, one below it is TooOld either way.
+                let low = self.window.highest().saturating_sub(REPLAY_WINDOW as u64 - 1);
+                self.rx.forget_before(low / crypto::KEY_ROTATION_INTERVAL);
                 Ok(pt)
             }
             other => {
@@ -269,8 +318,27 @@ impl Session {
         let f = streams::decode_frame(pt).map_err(|_| SessionError::BadFrame)?;
         match f.ftype {
             streams::FRAME_STREAM => {
+                // A peer that finished the handshake is trusted to be who it
+                // says, not to be well behaved: cap what it can make this
+                // side hold. Refused frames create no state and get no ACK.
+                if !self.rx_streams.contains_key(&f.id) && self.rx_streams.len() >= MAX_STREAMS {
+                    self.stat_overlimit += 1;
+                    return Ok(vec![]);
+                }
+                let expected = self.rx_streams.get(&f.id).map(|r| r.expected).unwrap_or(0);
+                if f.off > expected && self.rx_buffered >= MAX_RX_BUFFERED {
+                    self.stat_overlimit += 1;
+                    return Ok(vec![]);
+                }
                 let rx = self.rx_streams.entry(f.id).or_default();
+                let before = rx.buffered();
                 let out = rx.put(f.off, &f.data);
+                let after = rx.buffered();
+                if after >= before {
+                    self.rx_buffered += after - before;
+                } else {
+                    self.rx_buffered -= before - after;
+                }
                 if !out.is_empty() {
                     self.delivered.entry(f.id).or_default().extend_from_slice(&out);
                 }
@@ -284,7 +352,12 @@ impl Session {
                 }])
             }
             streams::FRAME_ACK => {
-                let tx = self.tx_streams.entry(f.id).or_default();
+                // An ACK names a stream this side sent on. A peer inventing
+                // ids must not create sender state for them.
+                let tx = match self.tx_streams.get_mut(&f.id) {
+                    Some(t) => t,
+                    None => return Ok(vec![]),
+                };
                 let before = tx.pending();
                 tx.on_ack(f.cum, &f.sacks);
                 let released = before - tx.pending();
@@ -356,6 +429,7 @@ impl Session {
         }
         out.extend(self.flush(now));
         debug_assert_eq!(self.in_flight_total, self.tx_streams.values().map(|t| t.pending()).sum::<usize>());
+        debug_assert_eq!(self.rx_buffered, self.rx_streams.values().map(|r| r.buffered()).sum::<usize>());
         out
     }
 }
