@@ -1,5 +1,6 @@
 // Node: holds identity, pins, sessions. Allocates session state only after
-// a verified handshake. Handshake DH work is budgeted per hub tick.
+// a verified handshake. Handshake DH work is budgeted per budget epoch
+// (BUDGET_EPOCH_TICKS ticks).
 
 use std::collections::HashMap;
 
@@ -19,13 +20,19 @@ use crate::wire;
 // Initiator retry policy: each attempt resends its byte-identical HS1
 // HS_RESENDS times, then escalates to a fresh attempt (new ephemeral, new
 // conn id, new stamp), up to HS_ATTEMPTS attempts in total.
-pub const HALF_OPEN_TTL: u64 = 20;
+// One tick is 1 ms, so this TTL is 400 ms.
+pub const HALF_OPEN_TTL: u64 = 400;
 pub const MAX_HALF_OPEN: usize = 64;
 pub const HS_RESENDS: u32 = 3;
 pub const HS_ATTEMPTS: u32 = 3;
 
-// Ceiling on all handshake DH work in one tick, whatever the source split.
+// Ceiling on all handshake DH work in one budget epoch, whatever the
+// source split.
 pub const HANDSHAKE_GLOBAL_BUDGET_PER_TICK: u32 = 64;
+
+// Length of the handshake budget epoch in ticks: budgets keep their v1
+// per-20 ms rate. The budget resets when tick / BUDGET_EPOCH_TICKS changes.
+pub const BUDGET_EPOCH_TICKS: u64 = 20;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConnectError {
@@ -86,7 +93,7 @@ pub struct Node {
     pub stats: NodeStats,
     pub logs: Vec<String>,
     pub registry: Option<Registry>,
-    budget_tick: u64,
+    budget_epoch: u64,
     budget_by_source: HashMap<Addr, u32>,
     budget_total: u32,
 }
@@ -107,7 +114,7 @@ impl Node {
             stats: NodeStats::default(),
             logs: Vec::new(),
             registry: None,
-            budget_tick: u64::MAX,
+            budget_epoch: u64::MAX,
             budget_by_source: HashMap::new(),
             budget_total: 0,
         }
@@ -146,7 +153,7 @@ impl Node {
     }
 
     pub fn connect(&mut self, name: &str, eph: Option<[u8; 32]>) -> Result<(u64, Vec<u8>), ConnectError> {
-        let t = if self.budget_tick == u64::MAX { 0 } else { self.budget_tick };
+        let t = if self.budget_epoch == u64::MAX { 0 } else { self.budget_epoch * BUDGET_EPOCH_TICKS };
         self.connect_at(name, eph, t)
     }
 
@@ -252,12 +259,15 @@ impl Node {
             self.stats.auth_fails += 1;
             return vec![];
         }
-        if self.budget_tick != tick {
-            self.budget_tick = tick;
+        // Budgets run in epochs of BUDGET_EPOCH_TICKS ticks, so 1 ms ticks
+        // keep the v1 per-20 ms rate.
+        let epoch = tick / BUDGET_EPOCH_TICKS;
+        if self.budget_epoch != epoch {
+            self.budget_epoch = epoch;
             self.budget_by_source.clear();
             self.budget_total = 0;
         }
-        // Per-source budget, then a global ceiling on the tick's work:
+        // Per-source budget, then a global ceiling on the epoch's work:
         // junk from one source cannot starve the others.
         let used = self.budget_by_source.get(&from).copied().unwrap_or(0);
         if used >= crypto::HANDSHAKE_DH_BUDGET_PER_TICK as u32 || self.budget_total >= HANDSHAKE_GLOBAL_BUDGET_PER_TICK {

@@ -18,8 +18,8 @@ pub const MAX_LOOKAHEAD: u64 = 1 << 20;
 pub const PING_RESENDS: u32 = 5;
 
 // Ticks without an authenticated packet from the peer before the session
-// is dropped.
-pub const IDLE_TTL: u64 = 600;
+// is dropped. One tick is 1 ms, so this is 12 s.
+pub const IDLE_TTL: u64 = 12_000;
 
 // Ticks of silence before this side asks the peer to speak.
 pub const KEEPALIVE_AFTER: u64 = IDLE_TTL / 3;

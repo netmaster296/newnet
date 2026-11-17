@@ -9,7 +9,7 @@
 // not its own.
 
 use newnet::crypto::{PeerRecord, SplitKeys};
-use newnet::node::{Node, MAX_HALF_OPEN};
+use newnet::node::{Node, BUDGET_EPOCH_TICKS, HALF_OPEN_TTL, MAX_HALF_OPEN};
 use newnet::noise_ik::{self, Hello};
 use newnet::session::Session;
 use newnet::streams::{self, Frame};
@@ -220,7 +220,7 @@ fn half_open_is_reaped_even_after_junk_data() {
     assert_eq!(b.on_datagram(&hs1, 1).len(), 1); // reply never reaches Alice
     b.on_datagram(&newnet::attacks::spoof_data(conn, 0, &[1u8; 32], b"junk"), 1);
     assert_eq!(b.half_open_count(), 1, "junk data neither opens nor removes it");
-    for t in 2..=60 {
+    for t in 2..=(HALF_OPEN_TTL + 60) {
         b.tick_sessions(t, 3);
     }
     assert_eq!(b.half_open_count(), 0, "unconfirmed handshake still held 59 ticks later");
@@ -232,7 +232,7 @@ fn half_open_table_is_bounded() {
     let (mut a, mut b) = pair();
     for i in 0..(MAX_HALF_OPEN as u64 + 6) {
         let (_c, hs1) = a.connect("bob", None).unwrap();
-        b.on_datagram(&hs1, 100 + i); // a new tick each time, so the DH budget is not the limit
+        b.on_datagram(&hs1, 100 + i * BUDGET_EPOCH_TICKS); // a new budget epoch each time, so the DH budget is not the limit
     }
     assert_eq!(b.half_open_count(), MAX_HALF_OPEN);
     assert_eq!(b.stats.half_open_dropped_full, 6);

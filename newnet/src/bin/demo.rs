@@ -327,7 +327,12 @@ fn main() {
     println!("[12] flood: 10k random + 1k garbage handshakes -> 0 sessions, DH work capped by per-tick budget ({dh_used} DH in {fr} ticks)");
 
     // MITM part 1: a forged HS2 neither completes nor ends Alice's handshake.
-    hub.step();
+    // The flood just spent this budget epoch's handshake budget, so move the
+    // hub a full epoch forward before the real handshake: budgets reset when
+    // tick / BUDGET_EPOCH_TICKS changes.
+    for _ in 0..=node::BUDGET_EPOCH_TICKS {
+        hub.step();
+    }
     let (conn, hs1) = nodes[ALICE].connect("bob.example", None).unwrap();
     let hs2 = nodes[BOB].on_datagram(&hs1, hub.tick);
     assert_eq!(hs2.len(), 1, "bob answers the untouched hs1 with exactly one hs2");
