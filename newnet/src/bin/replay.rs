@@ -297,7 +297,9 @@ fn main() {
                 }
                 buf.extend_from_slice(chunk);
                 let out = nodes[0].send_bytes(conn, stream, chunk, 0);
-                sent_pkts += out.len();
+                // Count chunks submitted, not datagrams released: with the
+                // in-flight cap most of them leave later, as ACKs arrive.
+                sent_pkts += chunk.len().div_ceil(newnet::streams::CHUNK);
                 sent_bytes += chunk.len() as u64;
                 for p in out {
                     hub.send(0, &p);
