@@ -133,6 +133,10 @@ pub struct Node {
     last_tick: u64,
     // Responder cookie secrets (rotation at the top of every HANDSHAKE1).
     cookies: CookieKeys,
+    // Minimum ticks between gap retransmits of one chunk on this node's
+    // sessions (amendment A6a). 1 in the in-memory lab; the UDP endpoint
+    // sets 20, which is 20 ms.
+    gap_interval: u64,
 }
 
 impl Node {
@@ -164,7 +168,22 @@ impl Node {
             budget_total: 0,
             last_tick: 0,
             cookies: CookieKeys::new(0),
+            gap_interval: 1,
         }
+    }
+
+    // Gap retransmit spacing for every session on this node (amendment
+    // A6a): stored here and pushed down to sessions, so a session opened
+    // later inherits the node's value.
+    pub fn set_gap_interval(&mut self, ticks: u64) {
+        self.gap_interval = ticks;
+        for s in self.sessions.values_mut() {
+            s.set_gap_interval(ticks);
+        }
+    }
+
+    pub fn gap_interval(&self) -> u64 {
+        self.gap_interval
     }
 
     // One line of the peers file becomes one record. The Ed25519 half is
@@ -534,12 +553,18 @@ impl Node {
                 return vec![];
             }
         };
-        let removed = self.pending_init.remove(&conn).unwrap();
-        if !self.make_session_room(&removed.peer) {
+        // Session room is checked BEFORE the attempt is consumed (amendment
+        // A6b): a full node drops the packet and leaves the pending attempt
+        // in place, so the handshake can still complete later instead of
+        // silently losing the attempt.
+        let peer = self.pending_init.get(&conn).unwrap().peer.clone();
+        if !self.make_session_room(&peer) {
             self.logs.push(format!("session refused conn={conn}: node at {MAX_SESSIONS} sessions"));
             return vec![];
         }
+        let removed = self.pending_init.remove(&conn).unwrap();
         let mut s = Session::from_split(conn, &keys, true);
+        s.set_gap_interval(self.gap_interval);
         // Follow the packet; fall back to the recorded destination when the
         // reply arrived with an unknown source.
         s.peer_addr = if from == ADDR_ANY { removed.to } else { from };
@@ -582,6 +607,7 @@ impl Node {
             // keys: that is the confirmation. The half-open entry stays only
             // while the proof fails.
             let mut s = Session::from_split(conn, &half.keys, false);
+            s.set_gap_interval(self.gap_interval);
             let pt = match s.open_data(&pkt) {
                 Ok(p) => p,
                 Err(_) => {

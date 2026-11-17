@@ -173,6 +173,10 @@ pub struct Session {
     // Chunks waiting for their first transmission, in the order the
     // application submitted them: (stream id, offset, chunk bytes).
     send_queue: std::collections::VecDeque<(u32, u64, Vec<u8>)>,
+    // Minimum ticks between gap retransmits of one chunk (amendment A6a).
+    // 1 in the in-memory lab, where a tick is one pump round; 20 on a real
+    // endpoint, where a tick is 1 ms.
+    gap_interval: u64,
     // Always equals the sum of pending() over all tx_streams.
     in_flight_total: usize,
     // Always equals the sum of buffered() over all rx_streams.
@@ -212,7 +216,16 @@ impl Session {
             send_queue: std::collections::VecDeque::new(),
             in_flight_total: 0,
             rx_buffered: 0,
+            gap_interval: 1,
         }
+    }
+
+    pub fn set_gap_interval(&mut self, ticks: u64) {
+        self.gap_interval = ticks;
+    }
+
+    pub fn gap_interval(&self) -> u64 {
+        self.gap_interval
     }
 
     pub fn in_flight_total(&self) -> usize {
@@ -386,7 +399,7 @@ impl Session {
                 let before = tx.pending();
                 tx.on_ack(f.cum, &f.sacks);
                 let released = before - tx.pending();
-                let mut reply = tx.gap_retransmit(f.id, now);
+                let mut reply = tx.gap_retransmit_spaced(f.id, now, self.gap_interval);
                 self.in_flight_total -= released;
                 reply.extend(self.flush(now));
                 Ok(reply)

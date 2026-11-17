@@ -229,15 +229,15 @@ impl StreamTx {
     }
 
     // Retransmit on gap: peer reported bytes past a hole we still hold.
-    // A chunk is re-sent at most once per tick; otherwise ACKs of our own
-    // retransmits re-fire the same hole and the traffic explodes.
-    pub fn gap_retransmit(&mut self, id: u32, now: u64) -> Vec<Frame> {
+    // A chunk is re-sent at most once per `interval` ticks; otherwise ACKs
+    // of our own retransmits re-fire the same hole and the traffic explodes.
+    pub fn gap_retransmit_spaced(&mut self, id: u32, now: u64, interval: u64) -> Vec<Frame> {
         let holes: Vec<(u64, Vec<u8>)> = self
             .in_flight
             .iter()
             .filter(|(off, (bytes, sent))| {
                 let end = **off + bytes.len() as u64 - 1;
-                *sent != now
+                now >= *sent + interval
                     && !self.covered(**off, end)
                     && (self.sacks.iter().any(|(a, _)| *a > end) || self.acked > end + 1)
             })
@@ -251,6 +251,12 @@ impl StreamTx {
             frames.push(mk_stream(id, off, &bytes));
         }
         frames
+    }
+
+    // The once-per-tick form, kept for the in-memory lab where one tick is
+    // one pump round.
+    pub fn gap_retransmit(&mut self, id: u32, now: u64) -> Vec<Frame> {
+        self.gap_retransmit_spaced(id, now, 1)
     }
 }
 
@@ -359,6 +365,33 @@ mod tail_tests {
         // timer must still be able to fire for everything unacked
         let t2 = tx.timeout(1, 30, 3);
         assert_eq!(t2.len(), 1); // chunk 1 was sack-covered and dropped; chunk 0 keeps retrying
+    }
+
+    #[test]
+    fn gap_interval_spaces_retransmits() {
+        let mut tx = StreamTx::new();
+        tx.send(1, &[5u8; 100], 0);
+        tx.send(1, &[6u8; 60], 0);
+        tx.on_ack(0, &[(100, 159)]);
+        // Interval 20: the hole opens with a retransmit at tick 100.
+        let g = tx.gap_retransmit_spaced(1, 100, 20);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].off, 0);
+        for t in 101..=119 {
+            assert!(
+                tx.gap_retransmit_spaced(1, t, 20).is_empty(),
+                "tick {t} is inside the 20-tick interval: no re-send"
+            );
+        }
+        let g = tx.gap_retransmit_spaced(1, 120, 20);
+        assert_eq!(g.len(), 1, "tick 120 is 20 ticks after tick 100: re-send");
+        // Interval 1: the tick after the retransmit already re-sends.
+        let mut tx = StreamTx::new();
+        tx.send(1, &[5u8; 100], 0);
+        tx.send(1, &[6u8; 60], 0);
+        tx.on_ack(0, &[(100, 159)]);
+        assert_eq!(tx.gap_retransmit_spaced(1, 100, 1).len(), 1);
+        assert_eq!(tx.gap_retransmit_spaced(1, 101, 1).len(), 1, "interval 1 re-sends at tick 101");
     }
 
     #[test]

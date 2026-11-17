@@ -177,3 +177,59 @@ fn restart_with_clock_stamp_passes_and_old_recording_fails() {
     assert_eq!(b2.half_open_count(), 1, "the refusal allocates nothing");
     assert!(b2.sessions.is_empty());
 }
+
+// Amendment A6(b): a node at MAX_SESSIONS that receives a valid
+// HANDSHAKE2 for a pending attempt drops the packet and KEEPS the
+// attempt: room is checked before the attempt is consumed.
+#[test]
+fn a_full_initiator_keeps_its_pending_attempt() {
+    let mut a = Node::new("alice", 0xA11CE);
+    let mut rs: Vec<Node> = (0..17).map(|i| Node::new(&format!("r{i}"), 0xB0B + i as u64)).collect();
+    for r in rs.iter_mut() {
+        r.records.insert(
+            "alice".into(),
+            PeerRecord { name: "alice".into(), ed: Some(a.ident.ed_pub()), x: a.ident.x_pub, expiry: u64::MAX },
+        );
+        a.records.insert(
+            r.name.clone(),
+            PeerRecord { name: r.name.clone(), ed: Some(r.ident.ed_pub()), x: r.ident.x_pub, expiry: u64::MAX },
+        );
+    }
+    // Fill `a` with MAX_SESSIONS sessions: four each with r1..r16. r0
+    // holds none, so its attempt meets the node-wide cap, not the per-peer one.
+    let mut n = 0u64;
+    for i in 1..=16usize {
+        for j in 0..4u64 {
+            let tick = i as u64 * BUDGET_EPOCH_TICKS + j;
+            let (conn, hs1) = a.connect_at(&rs[i].name, None, tick).unwrap();
+            let hs1 = complete_cookie_round(&mut a, &mut rs[i], hs1, ADDR_ANY);
+            let hs2 = rs[i].on_datagram(&hs1, tick);
+            assert_eq!(hs2.len(), 1, "the responder answers: {:?}", rs[i].stats);
+            let confirm = a.on_datagram(&hs2[0], tick);
+            assert_eq!(confirm.len(), 1, "the initiator proves its keys: {:?}", a.stats);
+            let reply = rs[i].on_datagram(&confirm[0], tick);
+            assert_eq!(reply.len(), 1, "the responder answers the confirming PING");
+            assert!(a.on_datagram(&reply[0], tick).is_empty());
+            assert!(a.is_open(conn), "session {n} is open on the initiator");
+            n += 1;
+        }
+    }
+    assert_eq!(n, MAX_SESSIONS as u64);
+    assert_eq!(a.sessions.len(), MAX_SESSIONS, "the initiator itself is full");
+    assert_eq!(a.stats.sessions_refused_full, 0, "filling to exactly the cap refuses nothing");
+
+    // A fresh attempt to r0 completes its round and gets a valid
+    // HANDSHAKE2, but there is no room on `a`.
+    let tick = 17 * BUDGET_EPOCH_TICKS;
+    let (c65, hs1) = a.connect_at("r0", None, tick).unwrap();
+    let hs1 = complete_cookie_round(&mut a, &mut rs[0], hs1, ADDR_ANY);
+    let hs2 = rs[0].on_datagram(&hs1, tick);
+    assert_eq!(hs2.len(), 1, "the responder has room and answers: {:?}", rs[0].stats);
+    let before = a.pending_count();
+    let outs = a.on_datagram(&hs2[0], tick);
+    assert!(outs.is_empty(), "the full initiator sends nothing back");
+    assert_eq!(a.pending_count(), before, "the pending attempt is not consumed");
+    assert_eq!(a.stats.sessions_refused_full, 1, "the refusal is counted once");
+    assert_eq!(a.sessions.len(), MAX_SESSIONS, "the refusal changes no session state");
+    assert!(!a.is_open(c65));
+}

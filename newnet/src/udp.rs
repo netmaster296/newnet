@@ -16,6 +16,10 @@ pub const TIMEOUT_TICKS: u64 = 500;
 // Send pacing epochs (BURST per epoch) and the handshake budget: one epoch
 // is 20 ticks, so both keep the v1 per-20 ms rate with 1 ms ticks.
 pub const PACING_EPOCH_TICKS: u64 = 20;
+// Minimum ticks between gap retransmits of one chunk on a real endpoint
+// (amendment A6a): 20 ticks = 20 ms, the v1 rate. Without it a missing
+// chunk is re-sent once per millisecond and floods a slow receiver.
+pub const GAP_INTERVAL_TICKS: u64 = 20;
 // Datagrams one pacing epoch (20 ticks) may send.
 pub const BURST: usize = 32;
 pub const MAX_PEERS: usize = 4096;
@@ -56,6 +60,7 @@ impl UdpEndpoint {
         let epoch_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         node.set_stamp_base(epoch_ms);
         node.set_stamp_floor(epoch_ms.saturating_sub(300_000));
+        node.set_gap_interval(GAP_INTERVAL_TICKS);
         Ok(UdpEndpoint {
             node,
             socket,

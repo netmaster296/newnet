@@ -75,3 +75,15 @@ fn connect_uses_the_last_tick_seen() {
     let out = a.tick_sessions(537, 500);
     assert_eq!(out.len(), 1, "the first resend is due at tick 537, 500 ticks after tick 37");
 }
+
+// Amendment A6a: a real endpoint spaces gap retransmits by 20 ms, not 1 ms.
+#[test]
+fn the_udp_endpoint_spaces_gap_retransmits_by_twenty_ms() {
+    let ep = UdpEndpoint::bind(Node::new("gappy", 1), "127.0.0.1:0").unwrap();
+    assert_eq!(ep.node.gap_interval() * TICK_MS, 20, "the endpoint's gap retransmits are spaced by 20 ms");
+}
+
+#[test]
+fn a_lab_node_keeps_the_one_tick_interval() {
+    assert_eq!(Node::new("x", 1).gap_interval(), 1, "in the lab a tick is one pump round: interval stays 1");
+}
