@@ -83,7 +83,7 @@ pub struct PeerRecord {
     pub name: String,
     pub ed: VerifyingKey,
     pub x: XPublic,
-    pub cert: Vec<u8>,
+    pub expiry: u64,
 }
 
 #[cfg(test)]

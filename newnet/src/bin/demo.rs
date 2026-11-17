@@ -100,7 +100,7 @@ fn main() {
         nodes[i].pins.check_or_pin("registry.example", *anchor.ed_pub().as_bytes(), anchor.x_pub.as_bytes().to_owned(), u64::MAX, NOW).unwrap();
         nodes[i].records.insert(
             "registry.example".into(),
-            newnet::crypto::PeerRecord { name: "registry.example".into(), ed: anchor.ed_pub(), x: anchor.x_pub, cert: vec![] },
+            newnet::crypto::PeerRecord { name: "registry.example".into(), ed: anchor.ed_pub(), x: anchor.x_pub, expiry: u64::MAX },
         );
     }
 
@@ -325,7 +325,7 @@ fn main() {
     // MITM: Mallory stands between claiming alice.example with his own key.
     let rec = naming::parse_signed_bytes(&nodes[REG].registry.as_ref().unwrap().signed_bytes("alice.example").unwrap(), &anchor_vk, NOW).unwrap();
     nodes[MALLORY].pins.check_or_pin("alice.example", rec.ed, rec.x25519, rec.expiry, NOW).unwrap();
-    nodes[MALLORY].records.insert("alice.example".into(), newnet::crypto::PeerRecord { name: "alice.example".into(), ed: anchor_vk_from(&rec), x: crypto_x(&rec), cert: vec![] });
+    nodes[MALLORY].records.insert("alice.example".into(), newnet::crypto::PeerRecord { name: "alice.example".into(), ed: anchor_vk_from(&rec), x: crypto_x(&rec), expiry: u64::MAX });
     let (_, pkt) = nodes[MALLORY].connect("alice.example", Some(seed32(0x44))).unwrap();
     let mb = nodes[BOB].stats.auth_fails;
     hub.send(MALLORY, &pkt);

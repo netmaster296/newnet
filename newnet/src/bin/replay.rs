@@ -247,7 +247,7 @@ fn main() {
             name: nodes[other].name.clone(),
             ed: nodes[other].ident.ed_pub().clone(),
             x: nodes[other].ident.x_pub,
-            cert: vec![],
+            expiry: u64::MAX,
         };
         nodes[me].records.insert(rec.name.clone(), rec);
     }
