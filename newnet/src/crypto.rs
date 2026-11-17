@@ -1,15 +1,14 @@
 // One suite: X25519 + Ed25519 + ChaCha20-Poly1305 + SHA-256/HKDF.
 // Traffic keys rotate every 1000 packets; nonce = seq. The handshake
-// machine lives in noise.rs.
+// machine lives in noise_ik.rs.
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use ed25519_dalek::VerifyingKey;
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
-use x25519_dalek::{PublicKey as XPublic, StaticSecret};
+use x25519_dalek::PublicKey as XPublic;
 
-pub const PROTOCOL: &[u8] = b"NEWNET1_IK_";
 pub const KEY_ROTATION_INTERVAL: u64 = 1000;
 pub const TAG_LEN: usize = 16;
 pub const HANDSHAKE_DH_BUDGET_PER_TICK: usize = 4;
@@ -27,17 +26,6 @@ pub fn sha256(parts: &[&[u8]]) -> [u8; 32] {
         h.update(p);
     }
     h.finalize().into()
-}
-
-fn hkdf2s(salt: &[u8], ikm: &[u8], info: &[u8]) -> ([u8; 32], [u8; 32]) {
-    let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
-    let mut okm = [0u8; 64];
-    hk.expand(info, &mut okm).unwrap();
-    let mut a = [0u8; 32];
-    let mut b = [0u8; 32];
-    a.copy_from_slice(&okm[..32]);
-    b.copy_from_slice(&okm[32..]);
-    (a, b)
 }
 
 pub fn hkdf1(ikm: &[u8], info: &[u8]) -> [u8; 32] {
@@ -67,52 +55,6 @@ pub fn open(key: &[u8; 32], seq: u64, aad: &[u8], ct: &[u8]) -> Result<Vec<u8>, 
     c.decrypt(n, chacha20poly1305::aead::Payload { msg: ct, aad }).map_err(|_| ())
 }
 
-// Noise CipherState. Unset key: EncryptAndHash passes bytes through.
-#[derive(Clone)]
-pub struct CipherState {
-    ck: [u8; 32],
-    k: Option<[u8; 32]>,
-    n: u64,
-}
-
-impl CipherState {
-    pub fn new() -> Self {
-        CipherState { ck: [0u8; 32], k: None, n: 0 }
-    }
-    pub fn mix_key(&mut self, dh_out: &[u8; 32]) {
-        // Noise MixKey: chain the cipher key, do not replace it.
-        let (ck, k) = hkdf2s(&self.ck, dh_out, b"");
-        self.ck = ck;
-        self.k = Some(k);
-        self.n = 0;
-    }
-    pub fn encrypt(&mut self, ad: &[u8], pt: &[u8]) -> Vec<u8> {
-        match self.k {
-            None => pt.to_vec(),
-            Some(k) => {
-                let out = seal(&k, self.n, ad, pt).expect("encrypt space");
-                self.n += 1;
-                out
-            }
-        }
-    }
-    pub fn decrypt(&mut self, ad: &[u8], ct: &[u8]) -> Result<Vec<u8>, NoiseError> {
-        match self.k {
-            None => Ok(ct.to_vec()),
-            Some(k) => {
-                let pt = open(&k, self.n, ad, ct).map_err(|_| NoiseError::AuthFailed)?;
-                self.n += 1;
-                Ok(pt)
-            }
-        }
-    }
-    pub fn split(&self, h: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
-        // Noise Split: HKDF(ck, h) -> two transport keys bound to the transcript.
-        let _ = self.k.expect("split needs a mixed key");
-        hkdf2s(&self.ck, h, b"")
-    }
-}
-
 pub struct SplitKeys {
     pub a_to_b_gen0: [u8; 32],
     pub b_to_a_gen0: [u8; 32],
@@ -137,21 +79,11 @@ impl KeyChain {
     }
 }
 
-pub fn pad_protocol() -> [u8; 32] {
-    let mut p = [0u8; 32];
-    p[..PROTOCOL.len()].copy_from_slice(PROTOCOL);
-    p
-}
-
 pub struct PeerRecord {
     pub name: String,
     pub ed: VerifyingKey,
     pub x: XPublic,
     pub cert: Vec<u8>,
-}
-
-pub fn dh(s: &StaticSecret, p: &XPublic) -> [u8; 32] {
-    s.diffie_hellman(p).as_bytes().to_owned()
 }
 
 #[cfg(test)]

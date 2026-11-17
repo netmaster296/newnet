@@ -213,6 +213,7 @@ impl Session {
                 self.state = State::Closed;
                 Ok(vec![])
             }
+            streams::FRAME_PING => Ok(vec![]),
             _ => Err(SessionError::BadFrame),
         }
     }

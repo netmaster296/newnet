@@ -9,10 +9,18 @@ use crate::content::{self, Msg, Reader};
 use crate::crypto::{self, PeerRecord};
 use crate::identity::{Identity, PinStore};
 use crate::naming::{NameRecord, Registry};
-use crate::noise::{InitiatorHandshake, ResponderHandshake};
+use crate::noise_ik::{self, Hello, InitiatorHandshake, ResponderHandshake};
 use crate::session::{Session, SessionError};
 use crate::streams::Frame;
 use crate::wire;
+
+// Initiator retry policy: each attempt resends its byte-identical HS1
+// HS_RESENDS times, then escalates to a fresh attempt (new ephemeral, new
+// conn id, new stamp), up to HS_ATTEMPTS attempts in total.
+pub const HALF_OPEN_TTL: u64 = 20;
+pub const MAX_HALF_OPEN: usize = 64;
+pub const HS_RESENDS: u32 = 3;
+pub const HS_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConnectError {
@@ -33,6 +41,25 @@ pub struct NodeStats {
     pub data_badtag: u64,
     pub data_replay: u64,
     pub hs_retransmits: u64,
+    pub hs2_resent: u64,
+    pub hs_replay_dropped: u64,
+    pub half_open_dropped_full: u64,
+}
+
+struct PendingInit {
+    hs: InitiatorHandshake,
+    datagram: Vec<u8>,
+    peer: String,
+    sent: u64,
+    resends: u32,
+    attempt: u32,
+}
+
+struct HalfOpen {
+    msg1: Vec<u8>,
+    msg2: Vec<u8>,
+    keys: crypto::SplitKeys,
+    created: u64,
 }
 
 pub struct Node {
@@ -40,9 +67,11 @@ pub struct Node {
     pub ident: Identity,
     pub pins: PinStore,
     pub records: HashMap<String, PeerRecord>,
-    pub sessions: HashMap<u64, Session>,
-    pending_init: HashMap<u64, (InitiatorHandshake, Vec<u8>, u64, u32)>, // hs, msg1 bytes, sent tick, attempts
-    pending_resp: HashMap<u64, (ResponderHandshake, u64)>, // machine, created tick
+    pub sessions: HashMap<u64, Session>, // confirmed sessions only
+    pending_init: HashMap<u64, PendingInit>,
+    half_open: HashMap<u64, HalfOpen>,
+    last_stamp: HashMap<String, u64>, // greatest Hello.stamp accepted per peer name
+    next_stamp: u64,
     pub readers: HashMap<(u64, u32), Reader>,
     pub stats: NodeStats,
     pub logs: Vec<String>,
@@ -61,7 +90,9 @@ impl Node {
             records: HashMap::new(),
             sessions: HashMap::new(),
             pending_init: HashMap::new(),
-            pending_resp: HashMap::new(),
+            half_open: HashMap::new(),
+            last_stamp: HashMap::new(),
+            next_stamp: 0,
             readers: HashMap::new(),
             stats: NodeStats::default(),
             logs: Vec::new(),
@@ -99,18 +130,35 @@ impl Node {
     }
 
     pub fn connect_at(&mut self, name: &str, eph: Option<[u8; 32]>, tick: u64) -> Result<(u64, Vec<u8>), ConnectError> {
+        self.start_attempt(name, eph, tick, 1)
+    }
+
+    // One handshake attempt: fresh IK machine bound to conn via prologue,
+    // Hello(stamp, name) as the msg1 payload, stored for identical resends.
+    fn start_attempt(&mut self, name: &str, eph: Option<[u8; 32]>, tick: u64, attempt: u32) -> Result<(u64, Vec<u8>), ConnectError> {
         let rec = self.lookup_name(name).ok_or(ConnectError::NoRecord)?;
-        let mut hs = InitiatorHandshake::new(&self.ident, &rec, eph)
-            .map_err(|_| ConnectError::NoRecord)?;
         let conn = self.next_conn;
         self.next_conn = self.next_conn.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let body = hs.msg1_body(&self.ident, &self.name);
-        let pkt = wire::encode(
+        self.next_stamp += 1;
+        let stamp = self.next_stamp;
+        let mut hs = InitiatorHandshake::new(&self.ident.x_static.to_bytes(), rec.x.as_bytes(), &noise_ik::prologue(conn), eph)
+            .map_err(|_| ConnectError::NoRecord)?;
+        let body = hs.write_msg1(&noise_ik::encode_hello(&Hello { stamp, name: self.name.clone() }))
+            .map_err(|_| ConnectError::NoRecord)?;
+        let datagram = wire::encode(
             &wire::Header { version: wire::VERSION, ptype: wire::TYPE_HANDSHAKE1, conn_id: conn, seq: 0, len: body.len() as u16 },
             &body,
         );
-        self.pending_init.insert(conn, (hs, pkt.clone(), tick, 0));
-        Ok((conn, pkt))
+        self.pending_init.insert(conn, PendingInit { hs, datagram: datagram.clone(), peer: name.to_string(), sent: tick, resends: 0, attempt });
+        Ok((conn, datagram))
+    }
+
+    pub fn half_open_count(&self) -> usize {
+        self.half_open.len()
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending_init.len()
     }
 
     // One hub datagram in, datagrams to send back out. Never panics.
@@ -127,17 +175,27 @@ impl Node {
             }
         };
         match pkt.header.ptype {
-            wire::TYPE_HANDSHAKE1 => self.on_hs1(pkt, tick),
+            wire::TYPE_HANDSHAKE1 => self.on_hs1(pkt, bytes, tick),
             wire::TYPE_HANDSHAKE2 => self.on_hs2(pkt),
             wire::TYPE_DATA => self.on_data(pkt, tick),
             _ => vec![],
         }
     }
 
-    fn on_hs1(&mut self, pkt: wire::Packet, tick: u64) -> Vec<Vec<u8>> {
-        // An existing conn (half-open or live) is never reset by a replayed HS1.
-        // Initiator retransmits escalate to a fresh conn id instead.
-        if self.sessions.contains_key(&pkt.header.conn_id) || self.pending_resp.contains_key(&pkt.header.conn_id) {
+    fn on_hs1(&mut self, pkt: wire::Packet, bytes: &[u8], tick: u64) -> Vec<Vec<u8>> {
+        let conn = pkt.header.conn_id;
+        // A live conn is never reset by a replayed HS1.
+        if self.sessions.contains_key(&conn) {
+            self.stats.auth_fails += 1;
+            return vec![];
+        }
+        // Half-open: the identical HS1 gets the stored HS2 back, free of
+        // charge. Anything else on this conn is refused.
+        if let Some(half) = self.half_open.get(&conn) {
+            if half.msg1 == bytes {
+                self.stats.hs2_resent += 1;
+                return vec![half.msg2.clone()];
+            }
             self.stats.auth_fails += 1;
             return vec![];
         }
@@ -150,91 +208,144 @@ impl Node {
             return vec![];
         }
         self.budget_used += 1;
-        self.stats.dh_count += 1; // es happens in start before any payload check
-        let reg_lookup = |n: &str| self.lookup_name(n);
-        match ResponderHandshake::start(&self.ident, &pkt.body, &reg_lookup, None) {
-            Ok(mut resp) => {
-                self.stats.dh_count += 2; // ss in start, plus ee + se for msg2
-                let body2 = resp.msg2_body(&self.name);
-                let conn = pkt.header.conn_id;
-                let keys = resp.split();
-                let mut s = Session::from_split(conn, &keys, false);
-                s.transcript = keys.transcript_hash;
-                self.sessions.insert(conn, s);
-                self.pending_resp.insert(conn, (resp, tick));
-                self.stats.sessions_allocated += 1;
-                vec![wire::encode(
-                    &wire::Header { version: wire::VERSION, ptype: wire::TYPE_HANDSHAKE2, conn_id: conn, seq: 0, len: body2.len() as u16 },
-                    &body2,
-                )]
-            }
-            Err(crate::crypto::NoiseError::BadPayload) => {
-                self.stats.bad_header_dropped += 1;
-                vec![]
-            }
+        self.stats.dh_count += 2; // es and ss happen inside msg1, before any payload check
+        let mut hs = match ResponderHandshake::new(&self.ident.x_static.to_bytes(), &noise_ik::prologue(conn), None) {
+            Ok(h) => h,
             Err(_) => {
                 self.stats.auth_fails += 1;
-                vec![]
+                return vec![];
             }
+        };
+        let (payload, remote_static) = match hs.read_msg1(&pkt.body) {
+            Ok(v) => v,
+            Err(_) => {
+                self.stats.auth_fails += 1;
+                return vec![];
+            }
+        };
+        let hello = match noise_ik::decode_hello(&payload) {
+            Some(h) => h,
+            None => {
+                self.stats.bad_header_dropped += 1;
+                return vec![];
+            }
+        };
+        let rec = match self.lookup_name(&hello.name) {
+            Some(r) => r,
+            None => {
+                self.stats.auth_fails += 1;
+                return vec![];
+            }
+        };
+        if rec.x.as_bytes() != &remote_static {
+            self.stats.auth_fails += 1;
+            return vec![];
         }
+        // Stamps are per name and strictly increasing: a recorded HS1 can
+        // never re-open state, even under a fresh conn id.
+        if hello.stamp <= self.last_stamp.get(&hello.name).copied().unwrap_or(0) {
+            self.stats.hs_replay_dropped += 1;
+            self.stats.auth_fails += 1;
+            return vec![];
+        }
+        if self.half_open.len() >= MAX_HALF_OPEN {
+            self.stats.half_open_dropped_full += 1;
+            return vec![];
+        }
+        self.last_stamp.insert(hello.name.clone(), hello.stamp);
+        self.stats.dh_count += 2; // ee + se for msg2
+        let (msg2, keys) = match hs.write_msg2(&[]) {
+            Ok(v) => v,
+            Err(_) => {
+                self.stats.auth_fails += 1;
+                return vec![];
+            }
+        };
+        let datagram2 = wire::encode(
+            &wire::Header { version: wire::VERSION, ptype: wire::TYPE_HANDSHAKE2, conn_id: conn, seq: 0, len: msg2.len() as u16 },
+            &msg2,
+        );
+        self.half_open.insert(conn, HalfOpen { msg1: bytes.to_vec(), msg2: datagram2.clone(), keys, created: tick });
+        vec![datagram2]
     }
 
     fn on_hs2(&mut self, pkt: wire::Packet) -> Vec<Vec<u8>> {
         let conn = pkt.header.conn_id;
-        let (mut hs, _msg1, _sent, _att) = match self.pending_init.remove(&conn) {
-            Some(h) => h,
-            None => {
-                self.stats.no_session_dropped += 1;
-                return vec![];
-            }
-        };
-        match hs.msg2_accept(&pkt.body) {
-            Ok(keys) => {
-                let s = Session::from_split(conn, &keys, true);
-                self.logs.push(format!("handshake open conn={conn} transcript={}", hex::encode(s.transcript)));
-                self.sessions.insert(conn, s);
-                self.stats.sessions_allocated += 1;
-                vec![]
-            }
+        if !self.pending_init.contains_key(&conn) {
+            self.stats.no_session_dropped += 1;
+            return vec![];
+        }
+        // Read in place: a forged msg2 must not kill the attempt (snow
+        // restores its state on error).
+        let keys = match self.pending_init.get_mut(&conn).unwrap().hs.read_msg2(&pkt.body) {
+            Ok((_, keys)) => keys,
             Err(e) => {
                 self.stats.auth_fails += 1;
                 self.logs.push(format!("handshake fail conn={conn}: {e:?}"));
-                vec![]
+                return vec![];
             }
-        }
+        };
+        self.pending_init.remove(&conn);
+        let mut s = Session::from_split(conn, &keys, true);
+        let ping = s.seal_frame(&Frame { ftype: crate::streams::FRAME_PING, id: 0, off: 0, cum: 0, sacks: vec![], data: vec![] });
+        self.logs.push(format!("handshake open conn={conn} transcript={}", hex::encode(s.transcript)));
+        self.sessions.insert(conn, s);
+        self.stats.sessions_allocated += 1;
+        vec![ping]
     }
 
     fn on_data(&mut self, pkt: wire::Packet, tick: u64) -> Vec<Vec<u8>> {
         let conn = pkt.header.conn_id;
-        let s = match self.sessions.get_mut(&conn) {
-            Some(s) => s,
-            None => {
-                self.stats.no_session_dropped += 1;
-                return vec![];
-            }
-        };
-        let pt = match s.open_data(&pkt) {
-            Ok(p) => p,
-            Err(SessionError::BadTag) => {
-                self.stats.data_badtag += 1;
-                return vec![];
-            }
-            Err(SessionError::Replay(_)) => {
-                self.stats.data_replay += 1;
-                return vec![];
-            }
-            Err(_) => {
-                self.stats.bad_header_dropped += 1;
-                return vec![];
-            }
-        };
+        if self.sessions.contains_key(&conn) {
+            let s = self.sessions.get_mut(&conn).unwrap();
+            let pt = match s.open_data(&pkt) {
+                Ok(p) => p,
+                Err(SessionError::BadTag) => {
+                    self.stats.data_badtag += 1;
+                    return vec![];
+                }
+                Err(SessionError::Replay(_)) => {
+                    self.stats.data_replay += 1;
+                    return vec![];
+                }
+                Err(_) => {
+                    self.stats.bad_header_dropped += 1;
+                    return vec![];
+                }
+            };
+            self.handle_opened(conn, pt, tick)
+        } else if let Some(half) = self.half_open.get(&conn) {
+            // First DATA under a conn id proves the initiator holds the split
+            // keys: that is the confirmation. The half-open entry stays only
+            // while the proof fails.
+            let mut s = Session::from_split(conn, &half.keys, false);
+            let pt = match s.open_data(&pkt) {
+                Ok(p) => p,
+                Err(_) => {
+                    self.stats.data_badtag += 1;
+                    return vec![];
+                }
+            };
+            self.half_open.remove(&conn);
+            self.sessions.insert(conn, s);
+            self.stats.sessions_allocated += 1;
+            // The replay window already recorded this packet: handle the
+            // plaintext without opening it a second time.
+            self.handle_opened(conn, pt, tick)
+        } else {
+            self.stats.no_session_dropped += 1;
+            vec![]
+        }
+    }
+
+    // Process an already-opened frame payload on a confirmed session.
+    fn handle_opened(&mut self, conn: u64, pt: Vec<u8>, tick: u64) -> Vec<Vec<u8>> {
         self.stats.data_ok += 1;
+        let s = self.sessions.get_mut(&conn).unwrap();
         let replies = match s.on_frame(&pt, tick) {
             Ok(v) => v,
             Err(_) => return vec![],
         };
-        self.pending_resp.remove(&conn);
-        let s = self.sessions.get_mut(&conn).unwrap();
         let out: Vec<Vec<u8>> = replies.iter().map(|f| s.seal_frame(f)).collect();
         if s.state == crate::session::State::Closed {
             self.sessions.remove(&conn);
@@ -297,52 +408,50 @@ impl Node {
 
     pub fn tick_sessions(&mut self, now: u64, timeout: u64) -> Vec<(u64, Vec<u8>)> {
         let mut out = Vec::new();
-        // Initiator: resend HS1 on the same conn up to 3 times, then escalate
-        // to a fresh conn id (the peer never resets a conn it already knows).
-        let mut escalated: Vec<u64> = Vec::new();
-        let mut resends: Vec<(u64, Vec<u8>)> = Vec::new();
-        for (conn, (hs, pkt, sent, att)) in self.pending_init.iter_mut() {
-            let _ = hs;
-            if now >= *sent + timeout {
-                *att += 1;
-                *sent = now;
-                if *att <= 3 {
+        // Initiator: resend the byte-identical HS1 on the same conn up to
+        // HS_RESENDS times, then escalate to a fresh handshake: new
+        // ephemeral, new conn id, new stamp.
+        let expired: Vec<u64> = self
+            .pending_init
+            .iter()
+            .filter(|(_, p)| now >= p.sent + timeout)
+            .map(|(c, _)| *c)
+            .collect();
+        for conn in expired {
+            let resend = {
+                let p = self.pending_init.get_mut(&conn).unwrap();
+                if p.resends < HS_RESENDS {
+                    p.resends += 1;
+                    p.sent = now;
                     self.stats.hs_retransmits += 1;
-                    resends.push((*conn, pkt.clone()));
+                    Some(p.datagram.clone())
                 } else {
-                    escalated.push(*conn);
+                    None
                 }
+            };
+            if let Some(dgram) = resend {
+                out.push((conn, dgram));
+                continue;
+            }
+            let removed = self.pending_init.remove(&conn).unwrap();
+            if removed.attempt < HS_ATTEMPTS {
+                if let Ok((new_conn, dgram)) = self.start_attempt(&removed.peer, None, now, removed.attempt + 1) {
+                    self.logs.push(format!("hs attempt {} conn={new_conn} to {}", removed.attempt + 1, removed.peer));
+                    out.push((new_conn, dgram));
+                }
+            } else {
+                self.logs.push(format!("connect to {} failed: no answer", removed.peer));
             }
         }
-        out.extend(resends);
-        for old in escalated {
-            let (hs, pkt, _, _) = self.pending_init.remove(&old).unwrap();
-            self.logs.push(format!("hs escalate conn={old} -> new conn"));
-            let conn = self.next_conn;
-            self.next_conn = self.next_conn.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            // Same handshake body (same ephemeral), fresh conn id. The body
-            // bytes are reused verbatim; a cloned machine would re-encrypt
-            // with advanced nonces and fail the responder's fixed nonce.
-            let mut p = wire::decode(&pkt).expect("stored hs1 packet decodes");
-            p.header.conn_id = conn;
-            let pkt = wire::encode(&p.header, &p.body);
-            self.pending_init.insert(conn, (hs, pkt.clone(), now, 0));
-            out.push((conn, pkt));
-        }
-        // Responder: reap handshakes the initiator never confirmed with data.
-        let mut reap: Vec<u64> = Vec::new();
-        for (conn, (_r, created)) in self.pending_resp.iter() {
-            if now >= created + 20 {
-                reap.push(*conn);
-            }
-        }
+        // Responder: reap half-open handshakes the initiator never confirmed.
+        let reap: Vec<u64> = self
+            .half_open
+            .iter()
+            .filter(|(_, h)| now >= h.created + HALF_OPEN_TTL)
+            .map(|(c, _)| *c)
+            .collect();
         for conn in reap {
-            self.pending_resp.remove(&conn);
-            if let Some(s) = self.sessions.get(&conn) {
-                if s.tx_streams.is_empty() && s.stat_badtag == 0 && s.stat_replay == 0 {
-                    self.sessions.remove(&conn);
-                }
-            }
+            self.half_open.remove(&conn);
         }
         for (conn, s) in self.sessions.iter_mut() {
             let frames = s.tick_timeouts(now, timeout);
@@ -359,7 +468,7 @@ impl Node {
         let bytes = self.sessions.get_mut(&conn).map(|s| s.seal_frame(&f));
         self.sessions.remove(&conn);
         self.pending_init.remove(&conn);
-        self.pending_resp.remove(&conn);
+        self.half_open.remove(&conn);
         bytes
     }
 }
