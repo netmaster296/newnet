@@ -322,16 +322,42 @@ fn main() {
     assert!(dh_used <= 4 * (fr as u64) * crypto::HANDSHAKE_DH_BUDGET_PER_TICK as u64);
     println!("[12] flood: 10k random + 1k garbage handshakes -> 0 sessions, DH work capped by per-tick budget ({dh_used} DH in {fr} ticks)");
 
-    // MITM: Mallory stands between claiming alice.example with his own key.
-    let rec = naming::parse_signed_bytes(&nodes[REG].registry.as_ref().unwrap().signed_bytes("alice.example").unwrap(), &anchor_vk, NOW).unwrap();
-    nodes[MALLORY].pins.check_or_pin("alice.example", rec.ed, rec.x25519, rec.expiry, NOW).unwrap();
-    nodes[MALLORY].records.insert("alice.example".into(), newnet::crypto::PeerRecord { name: "alice.example".into(), ed: anchor_vk_from(&rec), x: crypto_x(&rec), expiry: u64::MAX });
-    let (_, pkt) = nodes[MALLORY].connect("alice.example", Some(seed32(0x44))).unwrap();
-    let mb = nodes[BOB].stats.auth_fails;
-    hub.send(MALLORY, &pkt);
-    pump(&mut hub, &mut nodes, 10);
-    assert!(nodes[BOB].stats.auth_fails > mb, "mallory's substituted key fails signature check");
-    println!("[13] MITM: substituted key in handshake -> registry-bound signature fails");
+    // MITM part 1: a forged HS2 neither completes nor ends Alice's handshake.
+    hub.step();
+    let (conn, hs1) = nodes[ALICE].connect("bob.example", None).unwrap();
+    let hs2 = nodes[BOB].on_datagram(&hs1, hub.tick);
+    assert_eq!(hs2.len(), 1, "bob answers the untouched hs1 with exactly one hs2");
+    let forged = newnet::wire::encode(
+        &newnet::wire::Header { version: newnet::wire::VERSION, ptype: newnet::wire::TYPE_HANDSHAKE2, conn_id: conn, seq: 0, len: 48 },
+        &[0x4Du8; 48],
+    );
+    let af0 = nodes[ALICE].stats.auth_fails;
+    let fout = nodes[ALICE].on_datagram(&forged, hub.tick);
+    assert!(fout.is_empty(), "forged hs2 gets no answer");
+    assert_eq!(nodes[ALICE].stats.auth_fails, af0 + 1, "forged hs2 costs exactly one auth fail");
+    assert!(!nodes[ALICE].is_open(conn), "forged hs2 does not open the session");
+    let aout = nodes[ALICE].on_datagram(&hs2[0], hub.tick);
+    assert_eq!(aout.len(), 1, "the real hs2 completes alice's handshake");
+    assert!(nodes[ALICE].is_open(conn), "alice open after real hs2");
+    let _bout = nodes[BOB].on_datagram(&aout[0], hub.tick);
+    assert!(nodes[BOB].is_open(conn), "bob open once alice's first frame confirms him");
+    let c = nodes[ALICE].close(conn).unwrap();
+    nodes[BOB].on_datagram(&c, hub.tick);
+    assert!(!nodes[BOB].is_open(conn), "close from alice ends bob's session");
+
+    // MITM part 2: stranger claiming alice.example with his own key.
+    let mut fake = newnet::node::Node::new("alice.example", 0x0BAD_5EED);
+    fake.records.insert("bob.example".into(), nodes[ALICE].lookup_name("bob.example").unwrap());
+    let (_, pkt) = fake.connect("bob.example", None).unwrap();
+    hub.step();
+    let bf = nodes[BOB].stats.auth_fails;
+    let bh = nodes[BOB].half_open_count();
+    let out = nodes[BOB].on_datagram(&pkt, hub.tick);
+    assert!(out.is_empty(), "bob answers the stranger with nothing");
+    assert_eq!(nodes[BOB].stats.auth_fails, bf + 1, "stranger costs exactly one auth fail");
+    assert_eq!(nodes[BOB].half_open_count(), bh, "stranger allocates no half-open state");
+
+    println!("[13] MITM: a forged reply neither completes nor ends Alice's handshake; a stranger claiming alice.example with his own key is refused by Bob");
 
     // Second contact: registry lies about bob.example with no handover.
     let m_ed = *nodes[MALLORY].ident.ed_pub().as_bytes();
@@ -395,14 +421,6 @@ fn main() {
     println!("  transcript (alice-bob): {}", hex::encode(tr));
     println!("  padding/cover traffic: OFF (cost would be extra bytes on the hub)");
     println!("\ndone.");
-}
-
-fn anchor_vk_from(r: &naming::NameRecord) -> ed25519_dalek::VerifyingKey {
-    ed25519_dalek::VerifyingKey::from_bytes(&r.ed).unwrap()
-}
-
-fn crypto_x(r: &naming::NameRecord) -> x25519_dalek::PublicKey {
-    r.x_pub()
 }
 
 
