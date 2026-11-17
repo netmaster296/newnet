@@ -47,3 +47,24 @@ fn budget_epoch_is_twenty_ticks() {
     assert_eq!(b.stats.handshake_dropped_budget, 1, "the handshake at tick 20 opens a new epoch");
     assert_eq!(b.stats.dh_count, 10, "the new epoch admits the next handshake");
 }
+
+// connect() must start the attempt at the tick the node last acted at, not
+// at the start of the 20-tick budget window: an HS1 sent after tick 37 gets
+// its first resend 500 ticks after 37, not after the window start.
+#[test]
+fn connect_uses_the_last_tick_seen() {
+    let mut a = Node::new("alice", 0xA11);
+    let b = Node::new("bob", 0xB0B);
+    a.records.insert(
+        "bob".into(),
+        PeerRecord { name: "bob".into(), ed: b.ident.ed_pub(), x: b.ident.x_pub, expiry: u64::MAX },
+    );
+    a.tick_sessions(37, 500);
+    a.connect("bob", None).unwrap();
+    for t in 38..=536 {
+        let out = a.tick_sessions(t, 500);
+        assert!(out.is_empty(), "no resend expected at tick {t}: the attempt started at tick 37");
+    }
+    let out = a.tick_sessions(537, 500);
+    assert_eq!(out.len(), 1, "the first resend is due at tick 537, 500 ticks after tick 37");
+}

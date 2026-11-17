@@ -96,6 +96,9 @@ pub struct Node {
     budget_epoch: u64,
     budget_by_source: HashMap<Addr, u32>,
     budget_total: u32,
+    // Greatest tick this node has acted at (datagram in or tick_sessions).
+    // connect() starts an attempt here, not at the budget-window start.
+    last_tick: u64,
 }
 
 impl Node {
@@ -117,6 +120,7 @@ impl Node {
             budget_epoch: u64::MAX,
             budget_by_source: HashMap::new(),
             budget_total: 0,
+            last_tick: 0,
         }
     }
 
@@ -153,8 +157,7 @@ impl Node {
     }
 
     pub fn connect(&mut self, name: &str, eph: Option<[u8; 32]>) -> Result<(u64, Vec<u8>), ConnectError> {
-        let t = if self.budget_epoch == u64::MAX { 0 } else { self.budget_epoch * BUDGET_EPOCH_TICKS };
-        self.connect_at(name, eph, t)
+        self.connect_at(name, eph, self.last_tick)
     }
 
     pub fn connect_at(&mut self, name: &str, eph: Option<[u8; 32]>, tick: u64) -> Result<(u64, Vec<u8>), ConnectError> {
@@ -223,6 +226,7 @@ impl Node {
     // One hub datagram in, datagrams to send back out. Every datagram
     // returned is a reply to `from`. Never panics.
     pub fn on_datagram_from(&mut self, from: Addr, bytes: &[u8], tick: u64) -> Vec<Vec<u8>> {
+        self.last_tick = tick;
         let pkt = match wire::decode(bytes) {
             Ok(p) => p,
             Err(wire::WireError::BadMagic) => {
@@ -538,6 +542,7 @@ impl Node {
     }
 
     pub fn tick_sessions(&mut self, now: u64, timeout: u64) -> Vec<(u64, Vec<u8>)> {
+        self.last_tick = now;
         let mut out = Vec::new();
         // Initiator: resend the byte-identical HS1 on the same conn up to
         // HS_RESENDS times, then escalate to a fresh handshake: new

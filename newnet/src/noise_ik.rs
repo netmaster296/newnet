@@ -5,7 +5,8 @@
 use crate::crypto::{NoiseError, SplitKeys};
 
 pub const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
-pub const PROLOGUE_TAG: &[u8] = b"NEWNET1";
+pub const PROLOGUE_TAG: &[u8] = b"NEWNET2";
+const MAX_NAME_LEN: usize = 64;
 
 /// PROLOGUE_TAG followed by conn_id as 8 little-endian bytes.
 pub fn prologue(conn_id: u64) -> Vec<u8> {
@@ -32,7 +33,8 @@ pub fn encode_hello(h: &Hello) -> Vec<u8> {
 }
 
 /// Strict inverse. None if too short, if the length field does not match the
-/// remaining bytes exactly, or if the name is not UTF-8.
+/// remaining bytes exactly, if the name is not UTF-8, or if the name breaks
+/// the label rule: 1 to 64 bytes, characters `a-z 0-9 . _ -`.
 pub fn decode_hello(b: &[u8]) -> Option<Hello> {
     if b.len() < 10 {
         return None;
@@ -41,6 +43,15 @@ pub fn decode_hello(b: &[u8]) -> Option<Hello> {
     let name_len = u16::from_le_bytes(b[8..10].try_into().unwrap()) as usize;
     let name_bytes = b.get(10..)?;
     if name_bytes.len() != name_len {
+        return None;
+    }
+    if name_len == 0 || name_len > MAX_NAME_LEN {
+        return None;
+    }
+    if !name_bytes
+        .iter()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'_' | b'-'))
+    {
         return None;
     }
     let name = std::str::from_utf8(name_bytes).ok()?.to_string();
@@ -158,5 +169,55 @@ impl ResponderHandshake {
             .map_err(|_| NoiseError::AuthFailed)?;
         out.truncate(n);
         Ok((out, split_keys(&mut self.hs)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prologue_is_newnet2_then_conn_id() {
+        let p = prologue(0x0102_0304_0506_0708);
+        assert_eq!(p.len(), 7 + 8, "exact 15 bytes");
+        assert_eq!(&p[..7], b"NEWNET2");
+        assert_eq!(&p[7..], &0x0102_0304_0506_0708u64.to_le_bytes());
+        assert_eq!(
+            p,
+            vec![b'N', b'E', b'W', b'N', b'E', b'T', b'2', 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
+        );
+        assert_eq!(PROLOGUE_TAG, b"NEWNET2");
+        assert_ne!(prologue(1), prologue(2), "conn_id is in the prologue");
+    }
+
+    #[test]
+    fn hello_name_rules() {
+        let cases: &[(&str, bool)] = &[
+            ("", false),
+            ("a", true),
+            ("a.b_c-1", true),
+            ("z9", true),
+            ("Alice", false),
+            ("a b", false),
+            ("a\tb", false),
+            ("a+b", false),
+            ("a/b", false),
+            ("a:b", false),
+            ("\u{e9}", false),
+        ];
+        let stamp = 0x0102_0304_0506_0708u64;
+        for (name, want_ok) in cases {
+            let bytes = encode_hello(&Hello { stamp, name: name.to_string() });
+            let got = decode_hello(&bytes);
+            if *want_ok {
+                assert_eq!(got, Some(Hello { stamp, name: name.to_string() }), "name {name:?}");
+            } else {
+                assert_eq!(got, None, "name {name:?} must be refused");
+            }
+        }
+        let n64 = "a".repeat(64);
+        assert_eq!(decode_hello(&encode_hello(&Hello { stamp, name: n64.clone() })).map(|h| h.name), Some(n64));
+        let n65 = "a".repeat(65);
+        assert_eq!(decode_hello(&encode_hello(&Hello { stamp, name: n65 })), None, "65 chars refused");
     }
 }

@@ -2,15 +2,23 @@
 // covered as AEAD associated data. Decode is total: no panics, Ok or Err.
 
 pub const MAGIC: [u8; 4] = *b"NEW1";
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 pub const HEADER_LEN: usize = 24;
 pub const MAX_DATAGRAM: usize = 1200;
 
 pub const TYPE_HANDSHAKE1: u8 = 0;
 pub const TYPE_HANDSHAKE2: u8 = 1;
 pub const TYPE_DATA: u8 = 2;
+pub const TYPE_COOKIE: u8 = 3;
+pub const COOKIE_LEN: usize = 16;
 // There is no cleartext close. A session ends with an authenticated CLOSE
 // frame inside a DATA packet; the header type only says how to demux.
+// Type 3 was the removed unauthenticated close in version 1; it is the
+// COOKIE datagram here, which is safe because the version byte changed.
+
+pub const HS1_MIN_DATAGRAM: usize = 147;
+pub const HS1_MAX_DATAGRAM: usize = 210;
+pub const HS2_DATAGRAM: usize = 72;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
@@ -60,7 +68,7 @@ pub fn decode(buf: &[u8]) -> Result<Packet, WireError> {
     if buf[4] != VERSION {
         return Err(WireError::BadVersion);
     }
-    if !matches!(buf[5], TYPE_HANDSHAKE1 | TYPE_HANDSHAKE2 | TYPE_DATA) {
+    if !matches!(buf[5], TYPE_HANDSHAKE1 | TYPE_HANDSHAKE2 | TYPE_DATA | TYPE_COOKIE) {
         return Err(WireError::BadType);
     }
     let conn_id = u64::from_le_bytes(buf[6..14].try_into().unwrap());
@@ -118,7 +126,7 @@ mod tests {
         p[0] = b'X';
         assert_eq!(decode(&p), Err(WireError::BadMagic));
         p = encode(&hdr(TYPE_DATA, 1, 1, body.len()), &body);
-        p[4] = 2;
+        p[4] = 1;
         assert_eq!(decode(&p), Err(WireError::BadVersion));
         p = encode(&hdr(TYPE_DATA, 1, 1, body.len()), &body);
         p[5] = 9;
@@ -127,6 +135,47 @@ mod tests {
         p.truncate(p.len() - 1); // header len no longer equals body
         assert_eq!(decode(&p), Err(WireError::LenMismatch));
         assert_eq!(decode(&[1, 2, 3]), Err(WireError::TooShort));
+    }
+
+    #[test]
+    fn version_one_is_refused() {
+        assert_eq!(VERSION, 2);
+        let body = vec![9u8; 40];
+        let mut p = encode(&hdr(TYPE_DATA, 1, 1, body.len()), &body);
+        assert_eq!(p[4], 2, "encode writes version 2");
+        p[4] = 1;
+        assert_eq!(decode(&p), Err(WireError::BadVersion));
+        p[4] = 0;
+        assert_eq!(decode(&p), Err(WireError::BadVersion));
+        p[4] = 3;
+        assert_eq!(decode(&p), Err(WireError::BadVersion));
+    }
+
+    #[test]
+    fn cookie_type_decodes() {
+        assert_eq!(TYPE_COOKIE, 3);
+        assert_eq!(COOKIE_LEN, 16);
+        let body = vec![0xA7u8; COOKIE_LEN];
+        let p = encode(&hdr(TYPE_COOKIE, 0x0102_0304_0506_0708, 0, body.len()), &body);
+        assert_eq!(p.len(), HEADER_LEN + COOKIE_LEN, "a COOKIE datagram is 40 bytes");
+        let d = decode(&p).unwrap();
+        assert_eq!(d.header.ptype, TYPE_COOKIE);
+        assert_eq!(d.header.conn_id, 0x0102_0304_0506_0708);
+        assert_eq!(d.header.seq, 0);
+        assert_eq!(d.header.len, 16);
+        assert_eq!(d.body, body);
+        assert!(HS1_MIN_DATAGRAM <= HS1_MAX_DATAGRAM);
+        assert_eq!(HS1_MIN_DATAGRAM, 147);
+        assert_eq!(HS1_MAX_DATAGRAM, 210);
+        assert_eq!(HS2_DATAGRAM, 72);
+    }
+
+    #[test]
+    fn type_four_is_refused() {
+        let body = vec![9u8; 40];
+        let mut p = encode(&hdr(TYPE_DATA, 1, 1, body.len()), &body);
+        p[5] = 4;
+        assert_eq!(decode(&p), Err(WireError::BadType));
     }
 
     #[test]
