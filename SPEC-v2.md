@@ -293,7 +293,7 @@ State per session: `unacked: u32` (ack-eliciting packets received since the last
 - R5: **at most one ACK per session per tick.** If R3 or R4 fires while `last_ack_tick == Some(now)`, the ACK waits for the next tick. This bounds ACK output to 1000 per second per session (at most 24 + 276 + 16 = 316 bytes each).
 - Sending an ACK sets `unacked = 0`, `last_ack_tick = Some(now)`.
 
-ACK contents: `largest` = `window.highest()`; `ack_delay = now - recv_largest_time`; `max_data` (section 6); ranges from `ReplayWindow::ranges(16, 256)`: scan the 256 newest packet numbers below and including `largest` in the replay-window bitmap, newest first, merge consecutive set bits into ranges, return at most 16. (Packets more than 256 behind are not re-reported; the sender will have judged them lost by then. Cost: at most 256 bit tests per ACK.)
+ACK contents: `largest` = `window.highest()`; `ack_delay = now - recv_largest_time`; `max_data` (section 6); ranges from `ReplayWindow::ranges(16, 256)`: scan the 256 newest packet numbers below and including `largest` in the replay-window bitmap, newest first, merge consecutive set bits into ranges, return at most 16. (Packets more than 256 behind are not re-reported; the sender will have judged them lost by then. Cost: at most 256 bit tests per ACK.) The bitmap holds every packet number, ACK-only packets included, so ranges can name packets the sender never tracked as ack-eliciting; 5.4 step 2 ignores numbers with no SentPacket.
 
 ### 5.3 Sender: state
 
@@ -310,9 +310,9 @@ Chunk bytes stay in the stream's `unacked: BTreeMap<offset, Vec<u8>>` (replacing
 ### 5.4 On receiving an ACK frame
 
 1. Sanity: if `largest >= tx_seq` (acknowledges a packet number never sent), drop the frame, count `bad_ack`. Same for any range with `end >= tx_seq`.
-2. For every `SentPacket` whose seq lies in any range: remove it; if it has a chunk, remove that chunk from the stream's `unacked` (if still there); update congestion state (section 7). Collect `newly_acked`.
+2. For every `SentPacket` whose seq lies in any range: remove it; if it has a chunk, remove that chunk from the stream's `unacked` (if still there); update congestion state (section 7) — for data packets only: a PING's bytes were never added to `bytes_in_flight`, so a PING entry takes no controller call. Collect `newly_acked`.
 3. If `newly_acked` is non-empty: `pto_count = 0`, `pto_base = now`. If the packet `largest` is among `newly_acked`: take an RTT sample (5.5). `largest_acked = max(largest_acked, largest)`.
-4. `max_data = max(send_limit, max_data)` (section 6). Mark the session `confirmed` (already done by `open_data`).
+4. `send_limit = max(send_limit, frame.max_data)` (section 6). Mark the session `confirmed` (already done by `open_data`).
 5. Run `detect_lost(now)` (5.6).
 
 ### 5.5 RTT (all in ticks, integer arithmetic)
@@ -337,14 +337,14 @@ Worked vector: first sample 100: srtt 100, rttvar 50. Second sample 200 with ack
 
 A tracked packet p is lost iff `largest_acked` exists, `p.seq < largest_acked`, and either `largest_acked - p.seq >= 3` (PACKET_THRESHOLD) or `now >= p.sent + loss_delay`. Iterate `sent` from the smallest seq upward and stop at the first packet that is not lost: both conditions are monotone in seq, so this is O(lost + 1) per call. A reordering of up to 2 packets therefore never causes a retransmission.
 
-`mark_lost(seq)`: remove from `sent`; subtract its bytes from `bytes_in_flight` (section 7) and call the controller's `on_lost`; if it has a chunk and the stream still holds that offset in `unacked`, push `(stream, offset)` onto `retx_queue` (a VecDeque, served before new chunks). If the chunk is no longer in `unacked`, nothing is queued (a copy was already acknowledged).
+`mark_lost(seq)`: remove from `sent`; for a data packet, subtract its bytes from `bytes_in_flight` (section 7) and call the controller's `on_lost` (a PING takes neither); if it has a chunk and the stream still holds that offset in `unacked`, push `(stream, offset)` onto `retx_queue` (a VecDeque, served before new chunks). If the chunk is no longer in `unacked`, nothing is queued (a copy was already acknowledged).
 
 `detect_lost` is called after every ACK and on every tick.
 
 ### 5.7 Timers
 
 - **Loss time**: covered by calling `detect_lost(now)` each tick.
-- **PTO** (tail loss, no ACK): if `sent` is non-empty, or the session is credit-blocked (`wants_credit`, section 6), and `now >= pto_base + pto << min(pto_count, 6)`: send one PING (exempt from the congestion window and pacer), `pto_count += 1`, `pto_base = now`. The PING's ACK arrives later than the stuck packets, and 5.6 then declares them lost. (This costs one RTT more than a QUIC data probe and has one mechanism instead of two.)
+- **PTO** (tail loss, no ACK): if `sent` is non-empty, or the session is credit-blocked (`wants_credit`, section 6), and `now >= pto_base + (pto << min(pto_count, 6))` (the shift binds tighter than the add): send one PING (exempt from the congestion window and pacer), `pto_count += 1`, `pto_base = now`. The PING's ACK arrives later than the stuck packets, and 5.6 then declares them lost. (This costs one RTT more than a QUIC data probe and has one mechanism instead of two.)
 - **Unconfirmed initiator**: if `!confirmed` and `pto_count >= PING_RESENDS (5)`: session state Closed (removed by the node). This replaces the v1 `ping_sent`/`pings` fields.
 - **Persistent congestion**: `pto_count >= 3` makes the controller reset to `MIN_CWND` (section 7).
 - Idle timeout (12 000 ticks) and keepalive (after 4 000 ticks, a PING) are unchanged in meaning; with the PING now answered by an ACK, `last_heard` still refreshes on any authenticated packet.
@@ -409,7 +409,7 @@ State: `cwnd`, `ssthresh`, `bytes_in_flight`, `recovery_seq: Option<u64>`.
 - `can_send(bytes)`: `bytes_in_flight + bytes <= cwnd`.
 - `on_sent(bytes)`: `bytes_in_flight += bytes` (STREAM packets only; PING probes are exempt).
 - `on_acked(bytes, seq)`: `bytes_in_flight -= bytes`; if `recovery_seq` is Some(r) and `seq <= r`: stop (no growth during recovery). If `cwnd < ssthresh`: `cwnd += bytes`; else `cwnd += max(1, MSS * bytes / cwnd)`. Clamp to MAX_CWND.
-- `on_lost(bytes, seq, next_seq)`: `bytes_in_flight -= bytes`; if `recovery_seq` is None or `seq > r`: `ssthresh = max(cwnd / 2, MIN_CWND)`, `cwnd = ssthresh`, `recovery_seq = Some(next_seq - 1)`. A loss of a packet sent before recovery began does not cut again. This uses packet numbers as the epoch, so no extra clock.
+- `on_lost(bytes, seq, next_seq)`: `bytes_in_flight -= bytes`; if `recovery_seq` is None or `seq > r`: `ssthresh = max(cwnd / 2, MIN_CWND)`, `cwnd = ssthresh`, `recovery_seq = Some(next_seq - 1)`. A loss of a packet sent before recovery began does not cut again. This uses packet numbers as the epoch, so no extra clock. `next_seq` = the smallest packet number greater than `seq` that has been sent or will be sent: the smallest tracked seq above `seq`, else `tx_seq` (tail loss: the epoch starts at the next packet, so `recovery_seq = tx_seq - 1` cuts nothing further until a later loss with `seq > recovery_seq`).
 - `on_persistent()`: `cwnd = MIN_CWND`, `recovery_seq = None`.
 - Slow start initial `ssthresh = u64::MAX`.
 
