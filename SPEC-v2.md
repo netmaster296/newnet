@@ -35,7 +35,7 @@ A6. Fixes found when the phase 1 chain was checked. Do both as one step, after s
 
 Stance: the smallest change from the current crate that is correct. Every mechanism below has one obvious implementation and at least one test that fails if it is written wrong. Where a bigger mechanism (several frame types, load-triggered cookies, per-stream credit, BBR-style pacing, DPAPI key storage) would be cleverer, this design takes the plain one and says what it costs.
 
-What I read: `local notes` (last three sections), `wire.rs`, `noise_ik.rs`, `node.rs`, `session.rs`, `streams.rs`, `crypto.rs`, `identity.rs`, `udp.rs`, and the listings of the other files. I did NOT read the bodies of `newnet/tests/*.rs`, `naming.rs`, `link.rs`, `replay.rs`, `demo.rs`, `udpfile.rs`; where a step says "existing tests change", the list is by file name and by what must be true, and the implementer finds exact lines with the compiler. Three numbers are assumptions to be measured, not facts: the CPU cost of one handshake message 1 (assumed 150 microseconds for two X25519 operations), how far the lab hub moves a "reordered" packet, and the throughput of the two real machines. Each is flagged where used.
+What I read: `wire.rs`, `noise_ik.rs`, `node.rs`, `session.rs`, `streams.rs`, `crypto.rs`, `identity.rs`, `udp.rs`, and the listings of the other files. I did NOT read the bodies of `newnet/tests/*.rs`, `naming.rs`, `link.rs`, `replay.rs`, `demo.rs`, `udpfile.rs`; where a step says "existing tests change", the list is by file name and by what must be true, and the implementer finds exact lines with the compiler. Three numbers are assumptions to be measured, not facts: the CPU cost of one handshake message 1 (assumed 150 microseconds for two X25519 operations), how far the lab hub moves a "reordered" packet, and the throughput of the two real machines. Each is flagged where used.
 
 ---
 
@@ -761,9 +761,9 @@ Session::rtt(&self) -> &Rtt
 
 ### Step 14. Clean-up, documentation, acceptance runs
 
-- Files: remove dead code and constants named in section 8 "Removed"; `local notes` gets a "Wire version 2" section replacing the v1 statements it supersedes (list them as the Handshake rework section does); `demo.rs` runs to the end.
+- Files: remove dead code and constants named in section 8 "Removed"; `demo.rs` runs to the end.
 - Tests to add: `tests/wire_v2_golden.rs`: byte-exact hex of one HANDSHAKE1 header, one COOKIE (40 bytes), one STREAM frame, one ACK frame, so any future layout change is a deliberate edit; `v1_datagram_is_ignored_by_node` (a v1 datagram gets no reply and no state).
-- Acceptance: `cargo test` green; the four trace replays byte-exact with replay counter 0 and ratio <= 1.03 at 1% loss and 2% reorder; two-machine transfer of 256 MiB recorded in MB/s in `local notes`; target >= 25 MB/s on gigabit Ethernet (an estimate, not a measurement; if lower, profile before changing the design); no `unsafe`.
+- Acceptance: `cargo test` green; the four trace replays byte-exact with replay counter 0 and ratio <= 1.03 at 1% loss and 2% reorder; two-machine transfer of 256 MiB recorded in MB/s in the maintainer's notes; target >= 25 MB/s on gigabit Ethernet (an estimate, not a measurement; if lower, profile before changing the design); no `unsafe`.
 - Mutation: change the version byte in the golden HANDSHAKE1: the golden test fails.
 
 ---
@@ -790,7 +790,7 @@ Every key test names the mutation it catches (section 10); the implementer appli
 6. Pass criteria: sender prints success only after the receiver's confirmation; SHA-256 of both files equal; run for 100 MB, then the same in the other direction, then a 1-byte file and an empty file.
 7. Capture (Wireshark or `tcpdump -i <if> udp port 4002` on the VM): the test file is made of a repeated marker string; search the capture for the marker: zero hits. The first four datagrams must be 147 to 210 bytes (HS1), 40 bytes (COOKIE), HS1 again, 72 bytes (HS2).
 8. Negative runs: (a) replace the peer line on one side with a key from a third `gen`: transfer fails with a clear error within the timeout and no output file or `.part` remains; (b) run the sender with only a seed identity against the VM address: refused with exit code 2; (c) pull the network cable or disable the adapter for 5 seconds mid-transfer: the transfer either completes after the link returns (PTO recovery) or fails cleanly at the idle timeout; it never writes a file that fails the hash; (d) start a second sender from a third key not in the peers file: the receiver logs `auth_fails` and the first transfer is unaffected.
-9. Record: MB/s, round-trip time from the logs, any retransmit counts, in `local notes`.
+9. Record: MB/s, round-trip time from the logs, any retransmit counts, in the maintainer's notes.
 
 ### 11.3 Performance-phase acceptance (steps 9 to 14)
 
@@ -811,4 +811,4 @@ Every key test names the mutation it catches (section 10); the implementer appli
 8. Connection-level flow control only? Recommend **yes** now; add per-stream credit only when an application needs two streams with different readers.
 9. Window 1 MiB and egress ceiling 64 datagrams per ms (about 77 MB/s)? Recommend **keep** for the first two-machine runs; raise the ceiling only after step 14 shows the cap is what limits throughput.
 10. Optimistic-ACK defence (skip packet numbers on purpose and reject ACKs for the skipped ones)? Recommend **not now**; the exposure is limited to the sender's own path at 1.2 MB in flight, and each added mechanism is one more place for a weak implementer to err.
-11. Should the first transfer use `udpfile`'s existing 1 GiB cap and `.part`/rename behaviour unchanged? Recommend **yes**. Separately, the `<out>.part` symlink overwrite noted in `local notes` is still open and unrelated to this design; fix it before using the tool on a shared machine.
+11. Should the first transfer use `udpfile`'s existing 1 GiB cap and `.part`/rename behaviour unchanged? Recommend **yes**. Separately, the `<out>.part` symlink overwrite noted in the maintainer's notes is still open and unrelated to this design; fix it before using the tool on a shared machine.

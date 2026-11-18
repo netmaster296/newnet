@@ -11,3 +11,6 @@ traces/*.gz
 # Owner's personal security notes: local only, not for the public repository.
 /Defensive Security.md
 /Offensive Security.md
+
+# Private working log. Local only. Never publish.
+/PLAN.md

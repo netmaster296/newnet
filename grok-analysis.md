@@ -1,10 +1,10 @@
 # Grok analysis — New Internet POC
 
-Date: 2026-11-16. Read of `local notes` and `newnet/src` as they sit. `cargo check --offline` was run. The crate was not modified, and `cargo test` was not run, because the library does not typecheck.
+Date: 2026-11-16. Read of `newnet/src` as it sits. `cargo check --offline` was run. The crate was not modified, and `cargo test` was not run, because the library does not typecheck.
 
 ## Status
 
-`local notes` says the proof of concept is green: 20 tests and a passing demo. That was true of an earlier tree. `newnet/target/debug/demo.exe` is still there from that build. The source no longer matches it.
+An earlier pass said the proof of concept is green: 20 tests and a passing demo. That was true of an earlier tree. `newnet/target/debug/demo.exe` is still there from that build. The source no longer matches it.
 
 `cargo check --offline` fails in `node.rs`:
 

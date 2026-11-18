@@ -8,7 +8,7 @@ Peers are known by their keys, not their addresses. Everything on the wire is en
 
 This is a research proof of concept. **It has not been audited. Do not rely on it to protect anything.**
 
-It has been tested on one machine, over the loopback interface. Nothing has been run across a real network yet. `local notes` opens with the current state and lists what is known to be open.
+It has been tested on one machine, over the loopback interface. Nothing has been run across a real network yet.
 
 ## What is here
 
@@ -47,7 +47,6 @@ udpfile send --identity host.key --peers host.peers --peer vm --to 127.0.0.1:400
 
 ## Documents
 
-- `local notes`: the design, the threat model, the full history, and a "Start here" section with the current state.
 - `SPEC-v2.md`: the specification for wire version 2.
 - `grok-analysis.md`: an early outside review.
 
